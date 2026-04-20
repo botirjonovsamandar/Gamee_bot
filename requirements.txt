@@ -1,5 +1,6 @@
 PySide6
 httpx[socks]
-curl_cffi
+curl_cffi>=0.15.0
 PyYAML
 telethon
+requests
