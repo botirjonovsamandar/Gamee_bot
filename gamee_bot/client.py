@@ -2,35 +2,42 @@ from __future__ import annotations
 
 import base64
 import json
+import random
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-from curl_cffi import requests as curl_requests
-from curl_cffi.requests.exceptions import HTTPError as CurlHttpError
-from requests.exceptions import HTTPError as RequestsHTTPError
-
 from gamee_bot.account_store import set_account_gamee_registration_state
 from gamee_bot.config import GameeConfig
+from gamee_bot.gamee_transport import (
+    GameeTransport,
+    GameeTransportError,
+    GameeTransportHTTPError,
+    GameeTransportRequest,
+    build_default_gamee_transport,
+)
 from gamee_bot.http_profile import GameeHttpClientProfile
-from gamee_bot.proxy_url import validate_proxy_url_for_httpx
 from gamee_bot.telethon_bridge import clear_init_cache
 
-# HTTP: неавторизован / запрет / нестандартные коды сессии. 429 — rate limit, не перелогиниваем.
-_HTTP_RELOGIN_STATUS_CODES = frozenset({401, 403, 419, 498})
+# HTTP: коды протухшей сессии; 403 часто означает WAF/прокси и не должен запускать relogin storm.
+_HTTP_RELOGIN_STATUS_CODES = frozenset({401, 419, 498})
 
-# Временные отказы WAF / лимиты — повтор до raise_for_status.
-_RETRYABLE_HTTP_STATUS = frozenset({403, 429, 502, 503, 504})
+# Временные отказы / лимиты — повтор до raise_for_status.
+_RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
 _MAX_HTTP_TRANSIENT_RETRIES = 4
+# Conservative rate limiting: match official client request velocities.
+# Under production credentials, request pacing must be indistinguishable
+# from a real user tapping through the Mini App UI.
+_HTTP_REQUEST_MAX_PARALLEL = 2
+_HTTP_REQUEST_START_GAP_SEC = 0.8
+_HTTP_REQUEST_START_JITTER_SEC = 1.2
 
 
 def _http_status_from_error(exc: BaseException) -> int | None:
-    """httpx.HTTPStatusError или requests/curl_cffi HTTPError — код ответа."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        return int(exc.response.status_code)
+    """Нормализованная HTTP-ошибка транспорта -> код ответа."""
     resp = getattr(exc, "response", None)
     if resp is not None:
         sc = getattr(resp, "status_code", None)
@@ -59,7 +66,18 @@ def _api_error_body_hint(raw: str) -> str:
 def _jsonrpc_message_suggests_relogin(message: str) -> bool:
     """Текст ошибки JSON-RPC — признаки протухшего токена (не лимит запросов 429)."""
     low = str(message).lower()
-    if any(x in low for x in ("401", "403", "498")):
+    if any(x in low for x in ("401", "419", "498")):
+        return True
+    if "403" in low and any(
+        x in low
+        for x in (
+            "session",
+            "expired",
+            "invalid token",
+            "authentication",
+            "unauthorized",
+        )
+    ):
         return True
     return any(
         x in low
@@ -610,24 +628,25 @@ class GameeSession:
 
 
 class GameeClient:
+    _request_semaphore = threading.Semaphore(_HTTP_REQUEST_MAX_PARALLEL)
+    _request_gate_lock = threading.Lock()
+    _next_request_not_before = 0.0
+
     def __init__(
         self,
         cfg: GameeConfig,
         *,
         proxy_url: str | None = None,
         http_profile: GameeHttpClientProfile,
+        transport: GameeTransport | None = None,
     ) -> None:
         self._cfg = cfg
-        self._proxy_url = proxy_url
-        if proxy_url:
-            validate_proxy_url_for_httpx(proxy_url)
-        # curl_cffi: TLS должен совпадать с session.http_profile.impersonate (одинаковый label).
-        proxies: dict[str, str] | None = None
-        if proxy_url:
-            proxies = {"http": proxy_url, "https": proxy_url}
-        self._client = curl_requests.Session(impersonate=http_profile.impersonate)
-        if proxies:
-            self._client.proxies.update(proxies)
+        self._transport = transport or build_default_gamee_transport(
+            backend_name=cfg.transport_backend,
+            proxy_url=proxy_url,
+            http_profile=http_profile,
+        )
+        self._proxy_url = self._transport.proxy_url
         # Один раз за жизнь клиента: GET prizes → cookie / контекст для Cloudflare перед API.
         self._browser_warmup_done = False
 
@@ -637,72 +656,69 @@ class GameeClient:
         return self._proxy_url
 
     def close(self) -> None:
-        self._client.close()
+        self._transport.close()
+
+    @classmethod
+    def _reserve_request_delay(cls) -> float:
+        with cls._request_gate_lock:
+            now = time.monotonic()
+            slot_at = max(now, cls._next_request_not_before)
+            cls._next_request_not_before = (
+                slot_at
+                + _HTTP_REQUEST_START_GAP_SEC
+                + random.uniform(0.0, _HTTP_REQUEST_START_JITTER_SEC)
+            )
+        return max(0.0, slot_at - now)
+
+    @staticmethod
+    def _retry_delay_seconds(attempt: int) -> float:
+        base = min(1.25 * (2**attempt), 18.0)
+        return base + random.uniform(0.25, min(1.75, max(0.25, base * 0.2)))
+
+    def _call_with_http_gate(self, fn):
+        self.__class__._request_semaphore.acquire()
+        try:
+            delay = self.__class__._reserve_request_delay()
+            if delay > 0:
+                time.sleep(delay)
+            return fn()
+        finally:
+            self.__class__._request_semaphore.release()
 
     def _ensure_prizes_page_warmup(self, session: GameeSession) -> None:
         """GET главной prizes — те же TLS/cookie jar, что и у POST api2 (как заход из браузера)."""
         if self._browser_warmup_done:
             return
         p = session.http_profile
-        headers = {
-            "accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
-                "image/apng,*/*;q=0.8"
-            ),
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": p.accept_language,
-            "upgrade-insecure-requests": "1",
-            "sec-ch-ua": p.sec_ch_ua,
-            "sec-ch-ua-mobile": p.sec_ch_ua_mobile,
-            "sec-ch-ua-platform": p.sec_ch_ua_platform,
-            "sec-ch-ua-full-version": p.sec_ch_ua_full_version,
-            "sec-ch-ua-full-version-list": p.sec_ch_ua_full_version_list,
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-            "sec-fetch-user": "?1",
-            # User-Agent не задаём: curl_cffi подставляет UA под impersonate (TLS+JA3);
-            # свой Chrome/x.0.0.0 ломает пару с fingerprint → Cloudflare 403.
-        }
+        headers = p.ordered_navigation_headers()
         try:
-            self._client.get(
-                "https://prizes.gamee.com/",
-                headers=headers,
-                timeout=(15.0, 35.0),
-                allow_redirects=True,
+            resp = self._call_with_http_gate(
+                lambda: self._transport.send(
+                    GameeTransportRequest(
+                        method="GET",
+                        url="https://prizes.gamee.com/",
+                        headers=headers,
+                        timeout=(15.0, 35.0),
+                        allow_redirects=True,
+                        purpose="bootstrap_page",
+                    )
+                )
             )
-        except OSError:
-            pass
-        self._browser_warmup_done = True
+        except GameeTransportError:
+            return
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if 200 <= code < 400:
+            self._browser_warmup_done = True
 
     def _headers(self, session: GameeSession) -> dict[str, str]:
         # Профиль согласован с TLS (session.http_profile ↔ self._http_profile при правильном использовании).
+        # Strict Chrome Android header ordering via OrderedDict.
         p = session.http_profile
-        # Как в HAR: prizes → api2 same-site, Client Hints.
-        h: dict[str, str] = {
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": p.accept_language,
-            "content-type": "text/plain;charset=UTF-8",
-            "origin": "https://prizes.gamee.com",
-            "referer": "https://prizes.gamee.com/",
-            "priority": p.priority,
-            "sec-ch-ua": p.sec_ch_ua,
-            "sec-ch-ua-mobile": p.sec_ch_ua_mobile,
-            "sec-ch-ua-platform": p.sec_ch_ua_platform,
-            "sec-ch-ua-full-version": p.sec_ch_ua_full_version,
-            "sec-ch-ua-full-version-list": p.sec_ch_ua_full_version_list,
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
-            "client-language": "ru",
-            "x-bot-header": "gamee",
-            "x-install-uuid": session.install_uuid,
-            # см. _ensure_prizes_page_warmup — без ручного User-Agent
-        }
-        if session.auth_token and session.token_valid():
-            h["authorization"] = f"Bearer {session.auth_token}"
-        return h
+        auth = session.auth_token if session.auth_token and session.token_valid() else ""
+        return p.ordered_api_headers(
+            install_uuid=session.install_uuid,
+            auth_token=auth,
+        )
 
     def _post_batch_raw(self, session: GameeSession, body: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, Any]]:
         """Один POST без перелогина. Для loginUsingTelegram — только так, иначе рекурсия."""
@@ -710,15 +726,27 @@ class GameeClient:
         payload = json.dumps(body, ensure_ascii=False)
         r = None
         for attempt in range(_MAX_HTTP_TRANSIENT_RETRIES):
-            r = self._client.post(
-                url,
-                headers=self._headers(session),
-                data=payload.encode("utf-8"),
-                timeout=(15.0, 50.0),
-            )
+            try:
+                r = self._call_with_http_gate(
+                    lambda: self._transport.send(
+                        GameeTransportRequest(
+                            method="POST",
+                            url=url,
+                            headers=self._headers(session),
+                            data=payload.encode("utf-8"),
+                            timeout=(15.0, 50.0),
+                            purpose="api_jsonrpc",
+                        )
+                    )
+                )
+            except GameeTransportError:
+                if attempt + 1 < _MAX_HTTP_TRANSIENT_RETRIES:
+                    time.sleep(self._retry_delay_seconds(attempt))
+                    continue
+                raise
             code = int(r.status_code)
             if code in _RETRYABLE_HTTP_STATUS and attempt + 1 < _MAX_HTTP_TRANSIENT_RETRIES:
-                time.sleep(min(1.25 * (2**attempt), 18.0))
+                time.sleep(self._retry_delay_seconds(attempt))
                 continue
             r.raise_for_status()
             break
@@ -731,12 +759,22 @@ class GameeClient:
         raise RuntimeError("Неожиданный ответ API")
 
     def _post_batch(self, session: GameeSession, body: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, Any]]:
-        """POST с автоматическим перелогином при HTTP 401/403/429 и др. (сессия ~неделя)."""
+        """POST с автоматическим перелогином только для явного протухания сессии."""
         try:
             return self._post_batch_raw(session, body)
-        except (httpx.HTTPStatusError, RequestsHTTPError, CurlHttpError) as e:
+        except GameeTransportHTTPError as e:
             code = _http_status_from_error(e)
-            if code in _HTTP_RELOGIN_STATUS_CODES:
+            raw = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    raw = resp.text or ""
+                except Exception:
+                    raw = ""
+            should_relogin = code in _HTTP_RELOGIN_STATUS_CODES
+            if not should_relogin and code == 403 and raw and _jsonrpc_message_suggests_relogin(raw):
+                should_relogin = True
+            if should_relogin:
                 session.auth_token = None
                 session.referral_linked = False
                 self.login_telegram(session)
@@ -750,11 +788,28 @@ class GameeClient:
         self.login_telegram(session)
 
     @staticmethod
+    def _invalidate_init_cache(session: GameeSession) -> None:
+        """Сбросить кеш initData для аккаунта — следующий вызов resolve_init_data получит свежий."""
+        try:
+            from gamee_bot.telethon_bridge import clear_init_cache
+            label = (session.account_label or "").strip()
+            if label:
+                clear_init_cache(label)
+        except Exception:
+            pass
+
+    @staticmethod
     def _by_id(rows: list[dict[str, Any]], req_id: str) -> dict[str, Any]:
         for row in rows:
             if row.get("id") == req_id:
                 return row
-        raise KeyError(req_id)
+        # Defensive: build a summary of what we DID get back for diagnostics
+        got_ids = [r.get("id", "<no id>") for r in rows] if rows else []
+        preview = str(rows)[:500] if rows else "<empty>"
+        raise RuntimeError(
+            f"API ответ не содержит '{req_id}'. "
+            f"Получены ID: {got_ids}. Тело: {preview}"
+        )
 
     def login_telegram(self, session: GameeSession) -> None:
         batch = [
@@ -770,23 +825,51 @@ class GameeClient:
         self._ensure_prizes_page_warmup(session)
         try:
             rows = self._post_batch_raw(session, batch)
-        except (RequestsHTTPError, CurlHttpError) as e:
+        except GameeTransportHTTPError as e:
+            resp = getattr(e, "response", None)
             raw = ""
-            if e.response is not None:
-                raw = e.response.text or ""
+            if resp is not None:
+                raw = resp.text or ""
             hint = _api_error_body_hint(raw)
+            self._invalidate_init_cache(session)
             raise RuntimeError(
-                f"loginUsingTelegram: HTTP {e.response.status_code if e.response else '?'} "
+                f"loginUsingTelegram: HTTP {resp.status_code if resp is not None else '?'} "
                 f"от {self._cfg.api_url!r} — {hint}"
             ) from e
+        if not rows or not isinstance(rows, list):
+            self._invalidate_init_cache(session)
+            raise RuntimeError(
+                f"loginUsingTelegram: пустой или неожиданный ответ от API: {str(rows)[:300]}"
+            )
+
+        # Handle batch-level server errors (id=None) — e.g. invalid initData,
+        # server overload, or rejected batch. These come as:
+        # {"jsonrpc": "2.0", "error": {...}, "id": null}
+        for row in rows:
+            if row.get("id") is None and "error" in row:
+                err_obj = row["error"]
+                code = err_obj.get("code", "?")
+                msg = err_obj.get("message", "unknown")
+                detail = err_obj.get("data", {})
+                reason = detail.get("reason", "") if isinstance(detail, dict) else str(detail)
+                self._invalidate_init_cache(session)
+                raise RuntimeError(
+                    f"loginUsingTelegram: сервер отклонил запрос "
+                    f"(code={code}, message={msg}, reason={reason}). "
+                    f"initData будет обновлён при следующей попытке."
+                )
+
         login_row = self._by_id(rows, "user.authentication.loginUsingTelegram")
         if "error" in login_row:
+            self._invalidate_init_cache(session)
             raise RuntimeError(str(login_row["error"]))
         result = login_row.get("result")
         if not isinstance(result, dict):
+            self._invalidate_init_cache(session)
             raise RuntimeError("login: нет result")
         token = _pick_token_from_login_result(result)
         if not token:
+            self._invalidate_init_cache(session)
             raise RuntimeError("login: нет authenticate token")
         session.auth_token = token
         session.money_usd_cents = 0

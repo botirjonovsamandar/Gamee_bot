@@ -133,8 +133,8 @@ class AccountsPreviewLoader(QThread):
                 client = GameeClient(
                     self._cfg.gamee, proxy_url=pxy, http_profile=prof
                 )
-            except ValueError as e:
-                err = str(e).strip() or "ошибка прокси"
+            except Exception as e:
+                err = str(e).strip() or "ошибка инициализации клиента"
                 if len(err) > 120:
                     err = err[:117] + "…"
                 add_row(
@@ -143,7 +143,7 @@ class AccountsPreviewLoader(QThread):
                         "energy": 0,
                         "gold": 0,
                         "gold_estimated_usd": None,
-                        "status": f"прокси: {err}",
+                        "status": f"клиент: {err}",
                         "last_error": err,
                         "last_move_at": "",
                         "regen_deadline_iso": None,

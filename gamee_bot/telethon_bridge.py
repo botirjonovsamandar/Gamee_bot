@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import platform
 import re
 import threading
 import time
@@ -15,6 +14,7 @@ from telethon.tl.functions.messages import RequestAppWebViewRequest
 from telethon.tl.types import InputBotAppShortName, InputPeerUser, InputUser
 
 from gamee_bot.config import AppConfig, TelethonConfig, resolve_account_gamee_start_param
+from gamee_bot.tma_auth import ensure_telegram_mini_app_init_data
 
 _init_cache: dict[tuple[str, str | None], tuple[str, float]] = {}
 _CACHE_TTL_SEC = 45 * 60
@@ -23,10 +23,21 @@ _CACHE_TTL_SEC = 45 * 60
 _session_io_locks: dict[str, threading.Lock] = {}
 _session_io_locks_guard = threading.Lock()
 
-# Явно отличаемся от Telegram Desktop (device_model / app_version в InitConnection),
-# чтобы MTProto-сессия бота не выглядела как дубликат официального клиента.
-_TELETHON_DEVICE_MODEL = "GameeBot"
-_TELETHON_APP_VERSION = "1.0"
+# Пул реальных Android-устройств для эмуляции официального Telegram-клиента.
+# Выбирается детерминированно по session path (один аккаунт — одно устройство).
+_ANDROID_DEVICE_POOL: tuple[tuple[str, str], ...] = (
+    ("Samsung SM-S908B", "SDK 34"),      # Galaxy S22 Ultra
+    ("Samsung SM-S918B", "SDK 34"),      # Galaxy S23 Ultra
+    ("Samsung SM-S928B", "SDK 34"),      # Galaxy S24 Ultra
+    ("Xiaomi 2201123G", "SDK 34"),       # Xiaomi 12 Pro
+    ("Xiaomi 23113RKC6G", "SDK 34"),     # Xiaomi 14 Pro
+    ("Google Pixel 8 Pro", "SDK 34"),    # Pixel 8 Pro
+    ("Google Pixel 7", "SDK 34"),        # Pixel 7
+    ("OnePlus IN2025", "SDK 34"),        # OnePlus 9 Pro
+    ("OnePlus CPH2449", "SDK 34"),       # OnePlus 11
+)
+_TELETHON_APP_VERSION = "10.14.5"
+_TELETHON_SYSTEM_VERSION = "Android 14"
 
 # Официальная мини-аппа Gamee в Telegram (как в t.me/gamee/start?startapp=…)
 _GAMEE_MINI_BOT_USERNAME = "gamee"
@@ -110,21 +121,23 @@ def _abs_session(session_file: str) -> str:
 
 def _client_for_session(path: str, api_id: int, api_hash: str) -> TelegramClient:
     """
-    Отдельный «отпечаток» устройства от Telegram Desktop; без receive_updates —
-    не поднимаем постоянный цикл апдейтов, только RPC для входа / WebView.
+    Эмулируем профиль Telegram Android: устройство выбирается из пула
+    детерминированно по пути сессии (один аккаунт — одно устройство).
+    Без receive_updates — только RPC для входа / WebView.
     """
-    rel = platform.release() or "unknown"
-    sysver = re.sub(r"-.+", "", rel)
+    import hashlib as _hl
+    idx = int.from_bytes(_hl.md5(path.encode()).digest()[:4], "big") % len(_ANDROID_DEVICE_POOL)
+    device_model, _sdk_tag = _ANDROID_DEVICE_POOL[idx]
 
     return TelegramClient(
         path,
         api_id,
         api_hash,
-        device_model=_TELETHON_DEVICE_MODEL,
-        system_version=sysver,
+        device_model=device_model,
+        system_version=_TELETHON_SYSTEM_VERSION,
         app_version=_TELETHON_APP_VERSION,
-        lang_code="ru",
-        system_lang_code="ru",
+        lang_code="en",
+        system_lang_code="en-US",
         receive_updates=False,
         connection_retries=3,
         request_retries=3,
@@ -184,7 +197,7 @@ async def _gamee_webview_init_data(client: TelegramClient, gamee_start_param: st
         raise RuntimeError(
             "Сессия Telethon не авторизована (в .session нет действующего входа). "
             "Типично: гонка по одному файлу сессии или прерванный вход. "
-            "В GameeBot мы не вызываем log_out и не завершаем чужие сессии Telegram. "
+            "Мы не вызываем log_out и не завершаем чужие сессии Telegram. "
             "Свой api_id/api_hash с my.telegram.org для этой программы снижает риски при смешении с TD. "
             "Повторите «Добавить аккаунт» или восстановите sessions/*.session.bak_*"
         )
@@ -199,7 +212,7 @@ async def _gamee_webview_init_data(client: TelegramClient, gamee_start_param: st
         RequestAppWebViewRequest(
             peer=peer,
             app=app,
-            platform="Web",
+            platform="android",
             write_allowed=True,
             start_param=gamee_start_param or None,
         )
@@ -212,7 +225,7 @@ async def _gamee_webview_init_data(client: TelegramClient, gamee_start_param: st
             "Проверьте реф в настройках: полную ссылку или хвост после startapp=. "
             f"Фрагмент URL: {url[:200]}…"
         )
-    return init
+    return ensure_telegram_mini_app_init_data(init)
 
 
 async def telethon_fetch_init_data(
@@ -263,7 +276,7 @@ def resolve_init_data(
     if not telethon_session or not telethon_session.strip():
         if not init_data:
             raise ValueError(f"Аккаунт «{record_label}»: нет init_data и telethon_session")
-        return init_data
+        return ensure_telegram_mini_app_init_data(init_data)
     tc = cfg.telethon
     spath = telethon_session_absolute_path(telethon_session, cfg.accounts_path)
     if not spath.is_file():
@@ -283,6 +296,6 @@ def resolve_init_data(
     async def _run_fetch() -> str:
         return await telethon_fetch_init_data(abs_s, tc, gamee_start_param=sp)
 
-    init = run_telethon_locked(abs_s, _run_fetch())
+    init = ensure_telegram_mini_app_init_data(run_telethon_locked(abs_s, _run_fetch()))
     _init_cache[cache_key] = (init, now)
     return init

@@ -15,8 +15,17 @@ QMenuBar {
     padding: 4px;
     border-bottom: 1px solid #2d3d52;
 }
+QMenuBar::item {
+    background: transparent;
+    padding: 6px 12px;
+    margin: 0 6px 0 0;
+    border-radius: 4px;
+}
 QMenuBar::item:selected {
     background-color: #2d4a7c;
+}
+QMenuBar::item:pressed {
+    background-color: #243b64;
 }
 QMenu {
     background-color: #1a2332;

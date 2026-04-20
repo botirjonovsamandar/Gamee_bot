@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -15,6 +16,22 @@ TELETHON_CREDENTIALS_REQUIRED_MSG = (
     "API development tools и нажмите «Сохранить»."
 )
 
+BACKGROUND_MODE_MANUAL_ONLY = "manual_only"
+BACKGROUND_MODE_READ_ONLY = "read_only"
+BACKGROUND_MODE_FULL_AUTO = "full_auto"
+_BACKGROUND_MODES = {
+    BACKGROUND_MODE_MANUAL_ONLY,
+    BACKGROUND_MODE_READ_ONLY,
+    BACKGROUND_MODE_FULL_AUTO,
+}
+
+GAMEE_TRANSPORT_BACKEND_DEFAULT = "curl_cffi_raw_http"
+
+# Official Telegram Android client credentials (public, from open-source builds).
+# Used as defaults when the user has not configured custom api_id/api_hash.
+TELEGRAM_ANDROID_API_ID = 4
+TELEGRAM_ANDROID_API_HASH = "014b35b6184100b085b0d0572f9b5103"
+
 
 def ensure_config_file(path: Path) -> None:
     """Создаёт config.yaml с шаблоном, если файла ещё нет (первый запуск / клон без конфига)."""
@@ -22,7 +39,21 @@ def ensure_config_file(path: Path) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     default: dict[str, Any] = {
-        "telethon": {"api_id": 0, "api_hash": ""},
+        "gamee": {"transport_backend": GAMEE_TRANSPORT_BACKEND_DEFAULT},
+        "telethon": {"api_id": TELEGRAM_ANDROID_API_ID, "api_hash": TELEGRAM_ANDROID_API_HASH},
+        "compliance": {
+            "background_mode": BACKGROUND_MODE_MANUAL_ONLY,
+            "session_duration_minutes": 45,
+            "quiet_hours_enabled": False,
+            "quiet_hours_start_hour": 0,
+            "quiet_hours_end_hour": 8,
+            "daily_move_budget": 30,
+            "max_moves_per_session": 8,
+            "error_cooldown_seconds": 30,
+            "stop_after_error_streak": 3,
+            "require_confirm_mass_code": True,
+            "require_confirm_play_session": True,
+        },
         "paths": {"accounts": "accounts.yaml"},
         "ui": {"window_title": "Gamee — кубик доски"},
     }
@@ -68,6 +99,58 @@ def parse_gamee_ref_input(raw: str | None) -> str | None:
     return s
 
 
+def _require_api_id() -> int:
+    raise ValueError(
+        "api_id не указан в config.yaml → telethon → api_id. "
+        "Получите свой api_id на https://my.telegram.org → API development tools."
+    )
+
+
+def _require_api_hash() -> str:
+    raise ValueError(
+        "api_hash не указан в config.yaml → telethon → api_hash. "
+        "Получите свой api_hash на https://my.telegram.org → API development tools."
+    )
+
+
+def normalize_background_mode(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if s == "rewards_only":
+        return BACKGROUND_MODE_READ_ONLY
+    if s in _BACKGROUND_MODES:
+        return s
+    return BACKGROUND_MODE_MANUAL_ONLY
+
+
+def background_mode_label(mode: str) -> str:
+    m = normalize_background_mode(mode)
+    if m == BACKGROUND_MODE_FULL_AUTO:
+        return "Полный автомат"
+    if m == BACKGROUND_MODE_READ_ONLY:
+        return "Только чтение"
+    return "Только ручной режим"
+
+
+def local_time_in_quiet_hours(
+    enabled: bool,
+    start_hour: int,
+    end_hour: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if not enabled:
+        return False
+    dt = now or datetime.now()
+    hour = int(dt.hour)
+    start = max(0, min(23, int(start_hour)))
+    end = max(0, min(23, int(end_hour)))
+    if start == end:
+        return True
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
 def gamee_proxy_table_summary(raw: Any) -> tuple[str, str]:
     """Тип прокси для ячейки таблицы; в подсказке — узел (хост:порт), без пароля в ячейке."""
     norm = normalize_gamee_proxy_url(raw)
@@ -103,6 +186,7 @@ def gamee_proxy_table_summary(raw: Any) -> tuple[str, str]:
 @dataclass
 class GameeConfig:
     api_url: str
+    transport_backend: str
     life_currency_id: int
     gold_currency_id: int
     ticket_currency_id: int
@@ -130,7 +214,7 @@ class TelegramConfig:
 
 @dataclass
 class TelethonConfig:
-    """Пара api_id + api_hash с my.telegram.org для входа по телефону (Telethon)."""
+    """Credentials for Telethon: official Android defaults or custom from my.telegram.org."""
 
     api_id: int
     api_hash: str
@@ -140,10 +224,26 @@ class TelethonConfig:
 
 
 @dataclass
+class ComplianceConfig:
+    background_mode: str
+    session_duration_minutes: int
+    quiet_hours_enabled: bool
+    quiet_hours_start_hour: int
+    quiet_hours_end_hour: int
+    daily_move_budget: int
+    max_moves_per_session: int
+    error_cooldown_seconds: int
+    stop_after_error_streak: int
+    require_confirm_mass_code: bool
+    require_confirm_play_session: bool
+
+
+@dataclass
 class AppConfig:
     gamee: GameeConfig
     telegram: TelegramConfig
     telethon: TelethonConfig
+    compliance: ComplianceConfig
     accounts_path: Path
     window_title: str
 
@@ -199,6 +299,24 @@ def _optional_int_yaml(raw: Any) -> int | None:
     return v if v > 0 else None
 
 
+def _int_yaml_default(
+    raw: Any,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        val = int(default)
+    if minimum is not None and val < minimum:
+        val = minimum
+    if maximum is not None and val > maximum:
+        val = maximum
+    return val
+
+
 def load_config(path: Path) -> AppConfig:
     ensure_config_file(path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -206,6 +324,7 @@ def load_config(path: Path) -> AppConfig:
     g = raw.get("gamee") or {}
     t = raw.get("telegram") or {}
     th = raw.get("telethon") or {}
+    c = raw.get("compliance") or {}
     p = raw.get("paths") or {}
     u = raw.get("ui") or {}
     acc = p.get("accounts", "accounts.yaml")
@@ -214,13 +333,17 @@ def load_config(path: Path) -> AppConfig:
         accounts_path = (base / accounts_path).resolve()
     ensure_accounts_file(accounts_path)
     try:
-        telethon_api_id = int(th.get("api_id", 0))
+        telethon_api_id = int(th.get("api_id", 0) or 0)
     except (TypeError, ValueError):
         telethon_api_id = 0
     telethon_api_hash = str(th.get("api_hash", "") or "").strip()
     return AppConfig(
         gamee=GameeConfig(
             api_url=str(g.get("api_url", "https://api2.gamee.com/")),
+            transport_backend=str(
+                g.get("transport_backend", GAMEE_TRANSPORT_BACKEND_DEFAULT)
+            ).strip()
+            or GAMEE_TRANSPORT_BACKEND_DEFAULT,
             life_currency_id=int(g.get("life_currency_id", 5)),
             gold_currency_id=int(g.get("gold_currency_id", 65)),
             ticket_currency_id=int(g.get("ticket_currency_id", 1)),
@@ -244,12 +367,37 @@ def load_config(path: Path) -> AppConfig:
             summary_interval_seconds=int(t.get("summary_interval_seconds", 3600)),
         ),
         telethon=TelethonConfig(
-            api_id=telethon_api_id,
-            api_hash=telethon_api_hash,
+            api_id=telethon_api_id if telethon_api_id > 0 else _require_api_id(),
+            api_hash=telethon_api_hash if telethon_api_hash else _require_api_hash(),
             gamee_start_param=parse_gamee_ref_input(
                 th.get("gamee_ref") if "gamee_ref" in th else th.get("mini_app_start_param")
             ),
             telegram_referral_ref=_optional_int_yaml(th.get("telegram_referral_ref")),
+        ),
+        compliance=ComplianceConfig(
+            background_mode=normalize_background_mode(c.get("background_mode")),
+            session_duration_minutes=_int_yaml_default(
+                c.get("session_duration_minutes", 45), 45, minimum=0
+            ),
+            quiet_hours_enabled=bool(c.get("quiet_hours_enabled", False)),
+            quiet_hours_start_hour=_int_yaml_default(
+                c.get("quiet_hours_start_hour", 0), 0, minimum=0, maximum=23
+            ),
+            quiet_hours_end_hour=_int_yaml_default(
+                c.get("quiet_hours_end_hour", 8), 8, minimum=0, maximum=23
+            ),
+            daily_move_budget=_int_yaml_default(c.get("daily_move_budget", 30), 30, minimum=1),
+            max_moves_per_session=_int_yaml_default(
+                c.get("max_moves_per_session", 8), 8, minimum=1
+            ),
+            error_cooldown_seconds=_int_yaml_default(
+                c.get("error_cooldown_seconds", 30), 30, minimum=5
+            ),
+            stop_after_error_streak=_int_yaml_default(
+                c.get("stop_after_error_streak", 3), 3, minimum=1
+            ),
+            require_confirm_mass_code=bool(c.get("require_confirm_mass_code", True)),
+            require_confirm_play_session=bool(c.get("require_confirm_play_session", True)),
         ),
         accounts_path=accounts_path,
         window_title=str(u.get("window_title", "Gamee — кубик доски")),
@@ -276,6 +424,7 @@ def save_config_sections(
     gamee: dict[str, Any] | None = None,
     telegram: dict[str, Any] | None = None,
     telethon: dict[str, Any] | None = None,
+    compliance: dict[str, Any] | None = None,
     paths: dict[str, Any] | None = None,
     ui: dict[str, Any] | None = None,
 ) -> None:
@@ -299,6 +448,10 @@ def save_config_sections(
         for k in ("mini_app_bot", "mini_app_short_name", "mini_app_start_param"):
             merged.pop(k, None)
         existing["telethon"] = merged
+    if compliance is not None:
+        merged = {**(existing.get("compliance") or {}), **compliance}
+        merged["background_mode"] = normalize_background_mode(merged.get("background_mode"))
+        existing["compliance"] = merged
     if paths is not None:
         merged = {**(existing.get("paths") or {}), **paths}
         existing["paths"] = merged

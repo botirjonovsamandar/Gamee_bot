@@ -30,12 +30,15 @@ from PySide6.QtWidgets import (
 
 from gamee_bot.account_store import load_accounts, remove_account_by_label, set_account_proxy_url
 from gamee_bot.config import (
+    BACKGROUND_MODE_MANUAL_ONLY,
     AppConfig,
     TELETHON_CREDENTIALS_REQUIRED_MSG,
+    background_mode_label,
     gamee_proxy_table_summary,
     load_config,
     telethon_credentials_ready,
 )
+from gamee_bot.ui.account_action_thread import AccountActionThread
 from gamee_bot.ui.add_account_dialog import AddAccountDialog
 from gamee_bot.ui.app_style import apply_app_style
 from gamee_bot.ui.edit_proxy_dialog import EditAccountProxyDialog
@@ -43,6 +46,10 @@ from gamee_bot.ui.enter_code_dialog import EnterCodeDialog
 from gamee_bot.ui.enter_code_thread import EnterCodeThread
 from gamee_bot.ui.settings_dialog import SettingsDialog
 from gamee_bot.regen import format_daily_checkin_countdown, format_next_live_countdown
+from gamee_bot.gamee_transport import (
+    gamee_transport_backend_blocker_message,
+    normalize_gamee_transport_backend,
+)
 from gamee_bot.telethon_bridge import clear_init_cache
 from gamee_bot.worker import BotWorker
 
@@ -59,14 +66,17 @@ class MainWindow(QMainWindow):
         self._logged_cfg_error_once = False
         self._telethon_ready = False
         self._enter_code_thread: EnterCodeThread | None = None
+        self._manual_action_thread: AccountActionThread | None = None
         self._known_account_labels: set[str] = set()
         self._session_gold_earned: defaultdict[str, int] = defaultdict(int)
         self._session_tickets_earned: defaultdict[str, int] = defaultdict(int)
         self._session_xp_earned: defaultdict[str, int] = defaultdict(int)
+        self._manual_moves_used_today: dict[str, tuple[str, int]] = {}
         self._daily_meta: dict[str, tuple[str, str | None, int, int]] = {}
         self._daily_claim_flash: dict[str, dict[str, Any]] = {}
         self._banned_row_labels: set[str] = set()
         self._worker_table_pending: list[Any] | None = None
+        self._last_rows_by_label: dict[str, dict[str, Any]] = {}
         self._worker_table_coalesce = QTimer(self)
         self._worker_table_coalesce.setSingleShot(True)
         self._worker_table_coalesce.setInterval(75)
@@ -80,6 +90,7 @@ class MainWindow(QMainWindow):
         self._apply_title()
         self._sync_bot_buttons()
         self._update_worker_status_label()
+        self._update_mode_notice()
 
     def open_settings_dialog(self) -> None:
         dlg = SettingsDialog(self._config_path, self)
@@ -87,13 +98,14 @@ class MainWindow(QMainWindow):
             return
         self._load_config_silent()
         self._apply_title()
+        self._update_mode_notice()
         if self._config_error:
             QMessageBox.warning(self, "Конфиг", self._config_error)
         elif self._telethon_ready:
             self._log.append("Настройки сохранены.")
             QTimer.singleShot(0, self._fill_table_with_placeholders)
         else:
-            self._log.append("Настройки сохранены. Укажите api_id и api_hash Telegram — без них нельзя добавить аккаунт или запустить бота.")
+            self._log.append("Настройки сохранены. Укажите api_id и api_hash Telegram — без них нельзя добавить аккаунт или запускать фоновые действия.")
             QTimer.singleShot(0, self._fill_table_with_placeholders)
 
     def _load_config_silent(self) -> None:
@@ -126,22 +138,104 @@ class MainWindow(QMainWindow):
         m.addAction(act_code)
 
     def _sync_bot_buttons(self) -> None:
+        manual_busy = self._manual_action_thread is not None and self._manual_action_thread.isRunning()
+        code_busy = self._enter_code_thread is not None and self._enter_code_thread.isRunning()
         running = self._worker is not None and self._worker.isRunning()
-        self._btn_start_bot.setEnabled(not running)
+        mode = self._cfg.compliance.background_mode if self._cfg is not None else BACKGROUND_MODE_MANUAL_ONLY
+        self._btn_start_bot.setEnabled(not running and not manual_busy and not code_busy and mode != BACKGROUND_MODE_MANUAL_ONLY)
         self._btn_stop_bot.setEnabled(running)
+        self._btn_enter_code.setEnabled(not manual_busy and not code_busy)
+        sel = self._selected_account_label() is not None
+        manual_enabled = sel and not running and not manual_busy and not code_busy
+        self._btn_sync_now.setEnabled(manual_enabled)
+        self._btn_claim_daily.setEnabled(manual_enabled)
+        self._btn_play_session.setEnabled(manual_enabled)
 
     def _update_worker_status_label(self) -> None:
         running = self._worker is not None and self._worker.isRunning()
-        if running:
-            self._worker_status.setText("● Бот запущен")
-            self._worker_status.setToolTip("Идёт цикл: все аккаунты из списка ходят сами при достаточной энергии.")
+        manual_busy = self._manual_action_thread is not None and self._manual_action_thread.isRunning()
+        mode = background_mode_label(
+            self._cfg.compliance.background_mode if self._cfg is not None else BACKGROUND_MODE_MANUAL_ONLY
+        )
+        if manual_busy and not running:
+            self._worker_status.setText("● Выполняется ручное действие")
+            self._worker_status.setToolTip("Идёт явная user-triggered операция по выбранному аккаунту.")
+            self._worker_status.setObjectName("workerStatusRunning")
+        elif running:
+            self._worker_status.setText(f"● Фон запущен · {mode}")
+            self._worker_status.setToolTip("Идёт фоновый цикл только в разрешённом режимом объёме.")
             self._worker_status.setObjectName("workerStatusRunning")
         else:
-            self._worker_status.setText("○ Бот остановлен")
-            self._worker_status.setToolTip('Нажмите «Запустить бота» слева.')
+            if self._cfg is not None and self._cfg.compliance.background_mode == BACKGROUND_MODE_MANUAL_ONLY:
+                self._worker_status.setText("○ Только ручной режим")
+                self._worker_status.setToolTip("Фон отключён настройкой compliance.background_mode=manual_only.")
+            else:
+                self._worker_status.setText(f"○ Фон остановлен · {mode}")
+                self._worker_status.setToolTip('Нажмите «Запустить фон» слева.')
             self._worker_status.setObjectName("workerStatusStopped")
         self._worker_status.style().unpolish(self._worker_status)
         self._worker_status.style().polish(self._worker_status)
+
+    def _update_mode_notice(self) -> None:
+        if self._cfg is None:
+            self._mode_notice.setText("")
+            return
+        c = self._cfg.compliance
+        backend_raw = self._cfg.gamee.transport_backend
+        backend = normalize_gamee_transport_backend(backend_raw)
+        backend_blocker = gamee_transport_backend_blocker_message(backend_raw)
+        quiet = "вкл." if c.quiet_hours_enabled else "выкл."
+        if backend_blocker:
+            backend_note = f"backend: {backend} (недоступен: {backend_blocker})"
+        else:
+            backend_note = f"backend: {backend}"
+        self._mode_notice.setText(
+            "Manual-first: TLS/HTTP профиль эмулирует Telegram Android WebView; Telethon использует профили реальных устройств. "
+            f"Фоновый режим: {background_mode_label(c.background_mode)}; quiet hours: {quiet}; "
+            f"лимит ручной сессии: {c.max_moves_per_session} ходов; дневной бюджет: {c.daily_move_budget}; {backend_note}."
+        )
+
+    def _ensure_transport_backend_ready(self, title: str) -> bool:
+        if self._cfg is None:
+            return False
+        backend_raw = self._cfg.gamee.transport_backend
+        blocker = gamee_transport_backend_blocker_message(backend_raw)
+        if blocker is None:
+            return True
+        backend = normalize_gamee_transport_backend(backend_raw)
+        msg = (
+            f"{blocker}\n\n"
+            f"Текущее значение config: gamee.transport_backend={backend_raw!r}"
+            f" (нормализовано: {backend!r})."
+        )
+        QMessageBox.warning(self, title, msg)
+        self._log.append(f"[transport] {blocker}")
+        return False
+
+    @staticmethod
+    def _day_key_local() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _moves_used_today(self, label: str) -> int:
+        key = self._day_key_local()
+        day, used = self._manual_moves_used_today.get(label, (key, 0))
+        if day != key:
+            self._manual_moves_used_today[label] = (key, 0)
+            return 0
+        return int(used)
+
+    def _remaining_manual_moves(self, label: str) -> int:
+        if self._cfg is None:
+            return 0
+        used = self._moves_used_today(label)
+        return max(0, int(self._cfg.compliance.daily_move_budget) - used)
+
+    def _consume_manual_moves(self, label: str, delta: int) -> None:
+        if delta <= 0:
+            return
+        key = self._day_key_local()
+        used = self._moves_used_today(label)
+        self._manual_moves_used_today[label] = (key, used + int(delta))
 
     def _add_account(self) -> None:
         self._load_config_silent()
@@ -164,8 +258,16 @@ class MainWindow(QMainWindow):
         if self._cfg is None or self._config_error:
             QMessageBox.critical(self, "Конфиг", self._config_error or "Нет конфига")
             return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Код", "Остановите фоновый режим перед массовым промокодом.")
+            return
+        if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
+            QMessageBox.information(self, "Код", "Дождитесь завершения текущего ручного действия.")
+            return
         if not self._telethon_ready:
             QMessageBox.warning(self, "Telegram API", TELETHON_CREDENTIALS_REQUIRED_MSG)
+            return
+        if not self._ensure_transport_backend_ready("Код"):
             return
         if self._enter_code_thread is not None and self._enter_code_thread.isRunning():
             QMessageBox.information(self, "Код", "Уже идёт отправка промокода.")
@@ -179,6 +281,26 @@ class MainWindow(QMainWindow):
         if not code:
             QMessageBox.warning(self, "Код", "Введите непустой код.")
             return
+        try:
+            accounts = load_accounts(self._cfg.accounts_path)
+        except Exception as e:
+            QMessageBox.critical(self, "accounts.yaml", str(e))
+            return
+        if (
+            self._cfg.compliance.require_confirm_mass_code
+            and accounts
+        ):
+            ans = QMessageBox.question(
+                self,
+                "Массовый промокод",
+                f"Отправить код на {len(accounts)} аккаунтов? Это последовательная массовая операция.\n\n"
+                "Важно: проект использует Telethon + raw HTTP, а не реальный Telegram WebView/браузер; "
+                "запросы эмулируют стандартный протокол Telegram Android WebView.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
         self._log.append(
             f"——— Промокод для всех аккаунтов (taskId={task_id}) ———"
         )
@@ -190,9 +312,115 @@ class MainWindow(QMainWindow):
         th.start()
 
     def _on_enter_code_thread_finished(self) -> None:
-        self._btn_enter_code.setEnabled(True)
         if self.sender() is self._enter_code_thread:
             self._enter_code_thread = None
+        self._sync_bot_buttons()
+
+    def _rows_for_display(self) -> list[dict[str, Any]]:
+        merged = {k: dict(v) for k, v in self._last_rows_by_label.items()}
+        try:
+            if self._cfg is not None:
+                ordered_labels = [a.label for a in load_accounts(self._cfg.accounts_path)]
+            else:
+                ordered_labels = []
+        except Exception:
+            ordered_labels = []
+        rows: list[dict[str, Any]] = []
+        for label in ordered_labels:
+            row = merged.pop(label, None)
+            if row is not None:
+                rows.append(row)
+        for row in merged.values():
+            rows.append(row)
+        return rows
+
+    def _on_manual_row_ready(self, row: object) -> None:
+        if not isinstance(row, dict):
+            return
+        label = str(row.get("label", "")).strip()
+        if not label:
+            return
+        self._last_rows_by_label[label] = dict(row)
+        self._on_table(self._rows_for_display())
+
+    def _on_manual_move_earned(
+        self, label: str, gold_delta: int, tickets_delta: int, xp_delta: int
+    ) -> None:
+        self._consume_manual_moves(label, 1)
+        self._on_session_earnings_move(label, gold_delta, tickets_delta, xp_delta)
+
+    def _on_manual_action_finished(self) -> None:
+        if self.sender() is self._manual_action_thread:
+            self._manual_action_thread = None
+        self._sync_bot_buttons()
+        self._update_worker_status_label()
+
+    def _start_manual_action(self, action: str) -> None:
+        self._load_config_silent()
+        if self._cfg is None or self._config_error:
+            QMessageBox.critical(self, "Конфиг", self._config_error or "Нет конфига")
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Ручное действие", "Сначала остановите фоновый режим.")
+            return
+        if self._enter_code_thread is not None and self._enter_code_thread.isRunning():
+            QMessageBox.information(self, "Ручное действие", "Дождитесь завершения массового промокода.")
+            return
+        if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
+            QMessageBox.information(self, "Ручное действие", "Уже выполняется другое ручное действие.")
+            return
+        if not self._ensure_transport_backend_ready("Ручное действие"):
+            return
+        label = self._selected_account_label()
+        if not label:
+            QMessageBox.information(self, "Ручное действие", "Сначала выберите аккаунт в таблице.")
+            return
+        move_limit = 0
+        if action == "play_session":
+            remaining = self._remaining_manual_moves(label)
+            move_limit = min(self._cfg.compliance.max_moves_per_session, remaining)
+            if move_limit <= 0:
+                QMessageBox.information(
+                    self,
+                    "Ручная серия ходов",
+                    f"Для «{label}» дневной бюджет ходов уже исчерпан.",
+                )
+                return
+            if self._cfg.compliance.require_confirm_play_session:
+                ans = QMessageBox.question(
+                    self,
+                    "Ручная серия ходов",
+                    f"Запустить серию ходов для «{label}»?\n"
+                    f"Лимит этой сессии: {move_limit}\n"
+                    f"Остаток дневного бюджета: {remaining}\n\n"
+                    "Важно: действие выполняется через Telethon + raw HTTP, а не через реальный Telegram WebView/браузер; "
+                    "явные маркеры клиента сохраняются.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    return
+        names = {
+            "sync": "Sync now",
+            "claim_daily": "Claim daily",
+            "play_session": "Play session",
+        }
+        self._log.append(f"[{label}] {names.get(action, action)} — старт.")
+        th = AccountActionThread(
+            self._cfg,
+            label,
+            action,
+            move_limit=move_limit,
+            parent=self,
+        )
+        self._manual_action_thread = th
+        th.log_line.connect(self._log.append)
+        th.row_ready.connect(self._on_manual_row_ready)
+        th.move_earned.connect(self._on_manual_move_earned)
+        th.finished.connect(self._on_manual_action_finished)
+        self._sync_bot_buttons()
+        self._update_worker_status_label()
+        th.start()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -205,9 +433,14 @@ class MainWindow(QMainWindow):
         title.setObjectName("panelTitle")
         layout.addWidget(title)
 
-        self._worker_status = QLabel("○ Бот остановлен")
+        self._worker_status = QLabel("○ Фон остановлен")
         self._worker_status.setObjectName("workerStatusStopped")
         layout.addWidget(self._worker_status)
+
+        self._mode_notice = QLabel("")
+        self._mode_notice.setObjectName("hintLabel")
+        self._mode_notice.setWordWrap(True)
+        layout.addWidget(self._mode_notice)
 
         self._total_gold_summary = QLabel("Всего по аккаунтам: 💰 0")
         self._total_gold_summary.setObjectName("totalGoldSummary")
@@ -217,16 +450,28 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._total_gold_summary)
 
         bar = QHBoxLayout()
-        self._btn_start_bot = QPushButton("Запустить бота")
-        self._btn_start_bot.setToolTip("Запускает цикл для всех аккаунтов из списка.")
+        self._btn_start_bot = QPushButton("Запустить фон")
+        self._btn_start_bot.setToolTip("Запускает разрешённый фоновый режим из настроек compliance.")
         self._btn_start_bot.clicked.connect(self._start_worker)
-        self._btn_stop_bot = QPushButton("Остановить бота")
+        self._btn_stop_bot = QPushButton("Остановить фон")
         self._btn_stop_bot.setObjectName("btnStop")
-        self._btn_stop_bot.setToolTip("Останавливает цикл полностью.")
+        self._btn_stop_bot.setToolTip("Останавливает фоновый цикл полностью.")
         self._btn_stop_bot.setEnabled(False)
         self._btn_stop_bot.clicked.connect(self._stop_worker)
         bar.addWidget(self._btn_start_bot)
         bar.addWidget(self._btn_stop_bot)
+        self._btn_sync_now = QPushButton("Sync now")
+        self._btn_sync_now.setToolTip("Ручная синхронизация выбранного аккаунта без фонового цикла.")
+        self._btn_sync_now.clicked.connect(lambda: self._start_manual_action("sync"))
+        bar.addWidget(self._btn_sync_now)
+        self._btn_claim_daily = QPushButton("Claim daily")
+        self._btn_claim_daily.setToolTip("Ручной клейм ежедневной награды для выбранного аккаунта.")
+        self._btn_claim_daily.clicked.connect(lambda: self._start_manual_action("claim_daily"))
+        bar.addWidget(self._btn_claim_daily)
+        self._btn_play_session = QPushButton("Play session")
+        self._btn_play_session.setToolTip("Ручная ограниченная серия ходов для выбранного аккаунта.")
+        self._btn_play_session.clicked.connect(lambda: self._start_manual_action("play_session"))
+        bar.addWidget(self._btn_play_session)
         self._btn_enter_code = QPushButton("Ввести код")
         self._btn_enter_code.setToolTip(
             "Промокод prizes.gamee.com для всех аккаунтов (telegram.checkTask.code)."
@@ -388,6 +633,18 @@ class MainWindow(QMainWindow):
         if not self._telethon_ready:
             QMessageBox.warning(self, "Telegram API", TELETHON_CREDENTIALS_REQUIRED_MSG)
             return
+        if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
+            QMessageBox.information(self, "Фон", "Дождитесь завершения текущего ручного действия.")
+            return
+        if self._cfg.compliance.background_mode == BACKGROUND_MODE_MANUAL_ONLY:
+            QMessageBox.information(
+                self,
+                "Фон",
+                "В настройках выбран только ручной режим. Используйте кнопки Sync now / Claim daily / Play session.",
+            )
+            return
+        if not self._ensure_transport_backend_ready("Фон"):
+            return
         self._worker_table_pending = None
         self._worker = BotWorker(self._cfg, self)
         self._worker.table_updated.connect(
@@ -404,7 +661,9 @@ class MainWindow(QMainWindow):
         self._worker.start()
         self._sync_bot_buttons()
         self._update_worker_status_label()
-        self._log.append("Бот запущен.")
+        self._log.append(
+            f"Фон запущен: {background_mode_label(self._cfg.compliance.background_mode)}."
+        )
 
     def _stop_worker(self) -> None:
         w = self._worker
@@ -427,7 +686,7 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._sync_bot_buttons()
         self._update_worker_status_label()
-        self._log.append("Бот остановлен.")
+        self._log.append("Фон остановлен.")
 
     
 
@@ -437,7 +696,7 @@ class MainWindow(QMainWindow):
     def _on_session_earnings_move(
         self, label: str, gold_delta: int, tickets_delta: int, xp_delta: int
     ) -> None:
-        """Счётчики с момента запуска софта; не сбрасываются при остановке бота."""
+        """Счётчики с момента запуска софта; не сбрасываются при остановке фона."""
         self._session_gold_earned[label] += gold_delta
         self._session_tickets_earned[label] += tickets_delta
         self._session_xp_earned[label] += xp_delta
@@ -571,6 +830,7 @@ class MainWindow(QMainWindow):
         sel = self._selected_account_label() is not None
         self._btn_delete.setEnabled(sel)
         self._btn_proxy.setEnabled(sel)
+        self._sync_bot_buttons()
 
     def _edit_selected_proxy(self) -> None:
         label = self._selected_account_label()
@@ -602,7 +862,7 @@ class MainWindow(QMainWindow):
             return
         w = self._worker
         if w is not None and w.isRunning():
-            w.wake_idle()
+            w.wake_idle(label)
             self._log.append(
                 f"Прокси для «{label}» обновлён: подхват при следующем проходе цикла этого аккаунта "
                 f"(ожидание между шагами прерывается сигналом; при ошибке/исключении пауза и так короткая, "
@@ -652,7 +912,7 @@ class MainWindow(QMainWindow):
         self._session_xp_earned.pop(label, None)
         w = self._worker
         if w is not None and w.isRunning():
-            w.wake_idle()
+            w.wake_idle(label)
         log = f"Аккаунт «{label}» удалён из accounts.yaml."
         if session_path is not None:
             log += f" Сессия: {session_path.name} (и связанные файлы при наличии)."
@@ -743,6 +1003,7 @@ class MainWindow(QMainWindow):
         self._regen_meta.clear()
         self._daily_meta.clear()
         self._banned_row_labels.clear()
+        self._last_rows_by_label = {}
         alive = {str(r.get("label", "")).strip() for r in rows if isinstance(r, dict)}
         alive.discard("")
         for k in list(self._daily_claim_flash.keys()):
@@ -759,6 +1020,8 @@ class MainWindow(QMainWindow):
                 if not isinstance(r, dict):
                     continue
                 label = str(r.get("label", ""))
+                if label:
+                    self._last_rows_by_label[label] = dict(r)
                 if label:
                     self._known_account_labels.add(label)
 
@@ -893,6 +1156,11 @@ class MainWindow(QMainWindow):
             w.stop()
         self._wait_thread_finish(self._worker, 30_000)
         self._worker = None
+        if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
+            self._manual_action_thread.requestInterruption()
+        self._wait_thread_finish(self._manual_action_thread, 30_000)
+        self._manual_action_thread = None
+        self._wait_thread_finish(self._enter_code_thread, 30_000)
         super().closeEvent(event)
 
 

@@ -24,7 +24,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gamee_bot.account_store import AccountRecord, append_account, safe_account_filename
+from gamee_bot.account_store import (
+    AccountRecord,
+    append_account,
+    load_accounts,
+    safe_account_filename,
+)
 from gamee_bot.config import AppConfig, resolve_account_gamee_start_param
 from gamee_bot.proxy_url import explain_proxy_formats_short
 from gamee_bot.telethon_bridge import (
@@ -34,6 +39,7 @@ from gamee_bot.telethon_bridge import (
     telethon_send_code,
     telethon_sign_in_and_fetch_init_data,
 )
+from gamee_bot.tma_auth import ensure_telegram_mini_app_init_data
 from gamee_bot.ui.proxy_probe_thread import ProxyProbeThread
 
 
@@ -415,10 +421,34 @@ class AddAccountDialog(QDialog):
         if not label:
             QMessageBox.warning(self, "Аккаунт", "Введите название аккаунта.")
             return None
+        try:
+            accounts = load_accounts(self._cfg.accounts_path)
+        except Exception:
+            accounts = []
+        for acc in accounts:
+            if acc.label.strip().casefold() == label.casefold():
+                QMessageBox.warning(self, "Аккаунт", f"Аккаунт «{label}» уже существует.")
+                return None
         sess_dir = self._accounts_dir / "sessions"
         sess_dir.mkdir(parents=True, exist_ok=True)
         fn = safe_account_filename(label)
-        return sess_dir / f"{fn}.session"
+        want = (sess_dir / f"{fn}.session").resolve()
+        for acc in accounts:
+            if not acc.telethon_session:
+                continue
+            cur = Path(acc.telethon_session)
+            if not cur.is_absolute():
+                cur = (self._accounts_dir / cur).resolve()
+            else:
+                cur = cur.resolve()
+            if cur == want:
+                QMessageBox.warning(
+                    self,
+                    "Сессия",
+                    f"Файл сессии {want.name} уже используется аккаунтом «{acc.label}».",
+                )
+                return None
+        return want
 
     def _wire_worker_str(self, w: _AsyncWorkerStr, on_ok, on_fail) -> None:
         self._active_workers.append(w)
@@ -634,6 +664,11 @@ class AddAccountDialog(QDialog):
         raw = self._normalize_pasted_init(self._init_data.toPlainText())
         if not raw:
             QMessageBox.warning(self, "Данные", "Вставьте строку init_data.")
+            return
+        try:
+            raw = ensure_telegram_mini_app_init_data(raw)
+        except ValueError as e:
+            QMessageBox.warning(self, "Данные", f"Некорректный Telegram Mini App initData: {e}")
             return
         if "=" not in raw:
             QMessageBox.warning(self, "Данные", "Строка должна содержать параметры вида user=…&hash=…")

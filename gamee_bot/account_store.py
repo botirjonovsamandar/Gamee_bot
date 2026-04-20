@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,10 +120,58 @@ def load_accounts(path: Path) -> list[AccountRecord]:
     return out
 
 
+def _write_yaml_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(data)
+        Path(tmp_name).replace(path)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _telethon_session_key(record: AccountRecord, base_dir: Path) -> str | None:
+    if not record.telethon_session:
+        return None
+    p = Path(record.telethon_session)
+    if not p.is_absolute():
+        p = (base_dir / p).resolve()
+    else:
+        p = p.resolve()
+    return str(p).casefold()
+
+
+def _ensure_account_append_is_safe(path: Path, record: AccountRecord) -> None:
+    existing = load_accounts(path)
+    want_label = record.label.strip().casefold()
+    for acc in existing:
+        if acc.label.strip().casefold() == want_label:
+            raise ValueError(f"Аккаунт «{record.label}» уже существует")
+    new_session_key = _telethon_session_key(record, path.parent.resolve())
+    if new_session_key is None:
+        return
+    for acc in existing:
+        cur_key = _telethon_session_key(acc, path.parent.resolve())
+        if cur_key == new_session_key:
+            raise ValueError(
+                f"Telethon-сессия для «{record.label}» конфликтует с аккаунтом «{acc.label}»"
+            )
+
+
 def save_accounts_template(path: Path, accounts: list[AccountRecord]) -> None:
     payload = {"accounts": [a.to_dict() for a in accounts]}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _write_yaml_atomic(path, payload)
 
 
 def _delete_telethon_session_files(session_path: Path) -> None:
@@ -173,8 +223,7 @@ def remove_account_by_label(path: Path, label: str) -> tuple[bool, Path | None]:
     if not found:
         return False, None
     data["accounts"] = new_items
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _write_yaml_atomic(path, data)
     if session_file is not None:
         _delete_telethon_session_files(session_file)
     return True, session_file
@@ -214,8 +263,7 @@ def set_account_gamee_registration_state(
     if not changed:
         return
     data["accounts"] = items
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _write_yaml_atomic(path, data)
 
 
 def set_account_proxy_url(path: Path, label: str, raw: str | None) -> bool:
@@ -243,12 +291,12 @@ def set_account_proxy_url(path: Path, label: str, raw: str | None) -> bool:
     if not changed:
         return False
     data["accounts"] = items
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _write_yaml_atomic(path, data)
     return True
 
 
 def append_account(path: Path, record: AccountRecord) -> None:
+    _ensure_account_append_is_safe(path, record)
     data = read_yaml_mapping(path)
     items = data.get("accounts")
     if items is None:
@@ -257,5 +305,4 @@ def append_account(path: Path, record: AccountRecord) -> None:
         raise ValueError("accounts.yaml: поле accounts должно быть списком")
     items.append(record.to_dict())
     data["accounts"] = items
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _write_yaml_atomic(path, data)

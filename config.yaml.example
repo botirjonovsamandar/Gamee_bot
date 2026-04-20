@@ -1,6 +1,7 @@
 # Скопируйте в config.yaml и заполните (config.yaml в .gitignore).
 gamee:
   api_url: https://api2.gamee.com/
+  transport_backend: curl_cffi_raw_http  # curl_cffi_raw_http | telegram_webview (stub, пока не реализован)
   life_currency_id: 5
   gold_currency_id: 65
   ticket_currency_id: 1
@@ -20,10 +21,24 @@ telegram:
   notify_on_season_claim: true
   summary_interval_seconds: 3600
 telethon:
-  api_id: 0
-  api_hash: ""
+  # Official Telegram Android credentials (public, from open-source builds).
+  # Override with custom values from my.telegram.org if needed.
+  api_id: 4
+  api_hash: "014b35b6184100b085b0d0572f9b5103"
   gamee_ref: null
   telegram_referral_ref: null
+compliance:
+  background_mode: manual_only  # manual_only | read_only
+  session_duration_minutes: 45
+  quiet_hours_enabled: false
+  quiet_hours_start_hour: 0
+  quiet_hours_end_hour: 8
+  daily_move_budget: 30
+  max_moves_per_session: 8
+  error_cooldown_seconds: 30
+  stop_after_error_streak: 3
+  require_confirm_mass_code: true
+  require_confirm_play_session: true
 paths:
   accounts: accounts.yaml
 ui:

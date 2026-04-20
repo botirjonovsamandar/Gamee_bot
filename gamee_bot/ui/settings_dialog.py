@@ -24,7 +24,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gamee_bot.config import read_full_config_yaml, save_config_sections
+from gamee_bot.config import (
+    BACKGROUND_MODE_FULL_AUTO,
+    BACKGROUND_MODE_MANUAL_ONLY,
+    BACKGROUND_MODE_READ_ONLY,
+    background_mode_label,
+    read_full_config_yaml,
+    save_config_sections,
+)
+from gamee_bot.gamee_transport import (
+    GAMEE_TRANSPORT_BACKEND_CURL_CFFI_RAW_HTTP,
+    GAMEE_TRANSPORT_BACKEND_TELEGRAM_WEBVIEW,
+    gamee_transport_backend_blocker_message,
+    normalize_gamee_transport_backend,
+)
 from gamee_bot.notify import TelegramNotifier
 from gamee_bot.telegram_messages import (
     format_board_move_message,
@@ -47,6 +60,7 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._tab_general(), "Общие")
+        tabs.addTab(self._tab_compliance(), "Режим и лимиты")
         tabs.addTab(self._tab_notify(), "Уведомления")
 
         buttons = QDialogButtonBox(
@@ -96,6 +110,12 @@ class SettingsDialog(QDialog):
         hint_api.setWordWrap(True)
         hint_api.setObjectName("hintLabel")
         api_l.addWidget(hint_api)
+        api_l.addWidget(
+            self._small_hint(
+                "Telethon эмулирует профиль реального Android-устройства (Samsung, Xiaomi, Pixel и др.) "
+                "для совместимости с протоколом Telegram Mini Apps."
+            )
+        )
 
         form = QFormLayout()
         form.setSpacing(12)
@@ -148,6 +168,178 @@ class SettingsDialog(QDialog):
         self._th_telegram_referral_ref.setText(
             str(int(tr)) if tr is not None and str(tr).strip() else ""
         )
+        return w
+
+    def _tab_compliance(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        lay.setContentsMargins(4, 8, 4, 8)
+
+        lead = QLabel("Manual-first и guardrails")
+        lead.setObjectName("settingsLead")
+        lay.addWidget(lead)
+        lay.addWidget(
+            self._small_hint(
+                "Raw HTTP + TLS impersonation не равны реальному WebView/браузеру. Поэтому фон ограничен чтением: "
+                "чувствительные write-операции остаются только ручными и по явной команде пользователя."
+            )
+        )
+
+        comp = self._raw.get("compliance") or {}
+        gamee = self._raw.get("gamee") or {}
+        backend_raw = str(gamee.get("transport_backend", "") or "")
+        backend = normalize_gamee_transport_backend(backend_raw)
+        backend_blocker = gamee_transport_backend_blocker_message(backend_raw)
+
+        backend_box = self._settings_card("Transport backend")
+        backend_l = QVBoxLayout(backend_box)
+        backend_l.addWidget(
+            self._small_hint(
+                "Сетевой backend выбирается явно через config и влияет на запуск всех сетевых действий."
+            )
+        )
+        self._transport_backend = QComboBox()
+        self._transport_backend.addItem(
+            "curl_cffi_raw_http (доступен)",
+            GAMEE_TRANSPORT_BACKEND_CURL_CFFI_RAW_HTTP,
+        )
+        self._transport_backend.addItem(
+            "telegram_webview (stub, пока недоступен)",
+            GAMEE_TRANSPORT_BACKEND_TELEGRAM_WEBVIEW,
+        )
+        backend_idx = max(0, self._transport_backend.findData(backend))
+        self._transport_backend.setCurrentIndex(backend_idx)
+        backend_l.addWidget(self._transport_backend)
+        lay.addWidget(backend_box)
+
+        mode_box = self._settings_card("Фоновый режим")
+        mode_l = QVBoxLayout(mode_box)
+        mode_l.addWidget(
+            self._small_hint(
+                "Фон разрешён только для чтения состояния. Клеймы, промокоды и игровые сессии не переводятся в скрытую автоматизацию."
+            )
+        )
+        self._bg_mode = QComboBox()
+        self._bg_mode.addItem(background_mode_label(BACKGROUND_MODE_MANUAL_ONLY), BACKGROUND_MODE_MANUAL_ONLY)
+        self._bg_mode.addItem(background_mode_label(BACKGROUND_MODE_READ_ONLY), BACKGROUND_MODE_READ_ONLY)
+        self._bg_mode.addItem(background_mode_label(BACKGROUND_MODE_FULL_AUTO), BACKGROUND_MODE_FULL_AUTO)
+        want_mode = str(comp.get("background_mode", BACKGROUND_MODE_MANUAL_ONLY) or "")
+        idx = max(0, self._bg_mode.findData(want_mode))
+        self._bg_mode.setCurrentIndex(idx)
+        mode_l.addWidget(self._bg_mode)
+        lay.addWidget(mode_box)
+
+        markers_box = self._settings_card("Явные маркеры клиента")
+        markers_l = QVBoxLayout(markers_box)
+        markers_l.addWidget(
+            self._small_hint(
+                "Сетевой слой использует заголовки, стандартные для Telegram Android WebView (<code>X-Requested-With: org.telegram.messenger</code>, мобильный User-Agent)."
+            )
+        )
+        markers_l.addWidget(
+            self._small_hint(
+                "Telethon-клиент использует профиль реального устройства через <code>device_model/app_version</code> "
+                "для полного паритета с официальным Android-клиентом Telegram."
+            )
+        )
+        markers_l.addWidget(
+            self._small_hint(
+                "Текущий стек — Telethon + raw HTTP. Это не настоящий Telegram WebView/браузер, поэтому browser-only проверки, fingerprint среды и input-telemetry здесь не эмулируются."
+            )
+        )
+        if backend_blocker:
+            markers_l.addWidget(
+                self._small_hint(
+                    f"Выбран transport backend <code>{backend}</code>, но он недоступен: {backend_blocker}"
+                )
+            )
+        else:
+            markers_l.addWidget(
+                self._small_hint(
+                    f"Активный transport backend: <code>{backend}</code>"
+                )
+            )
+        lay.addWidget(markers_box)
+
+        limits_box = self._settings_card("Лимиты активности")
+        limits_form = QFormLayout(limits_box)
+        limits_form.setSpacing(12)
+        limits_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._session_minutes = QSpinBox()
+        self._session_minutes.setRange(1, 720)
+        self._session_minutes.setSuffix(" мин")
+        self._session_minutes.setValue(max(1, int(comp.get("session_duration_minutes", 45))))
+
+        self._daily_move_budget = QSpinBox()
+        self._daily_move_budget.setRange(1, 1000)
+        self._daily_move_budget.setValue(max(1, int(comp.get("daily_move_budget", 30))))
+
+        self._max_moves_session = QSpinBox()
+        self._max_moves_session.setRange(1, 200)
+        self._max_moves_session.setValue(max(1, int(comp.get("max_moves_per_session", 8))))
+
+        self._error_cooldown = QSpinBox()
+        self._error_cooldown.setRange(5, 3600)
+        self._error_cooldown.setSuffix(" сек")
+        self._error_cooldown.setValue(max(5, int(comp.get("error_cooldown_seconds", 30))))
+
+        self._stop_after_error_streak = QSpinBox()
+        self._stop_after_error_streak.setRange(1, 20)
+        self._stop_after_error_streak.setValue(max(1, int(comp.get("stop_after_error_streak", 3))))
+
+        limits_form.addRow("Фоновая сессия максимум:", self._session_minutes)
+        limits_form.addRow("Дневной бюджет ходов:", self._daily_move_budget)
+        limits_form.addRow("Ходов за ручную сессию:", self._max_moves_session)
+        limits_form.addRow("Cooldown после серии ошибок:", self._error_cooldown)
+        limits_form.addRow("Стоп после ошибок подряд:", self._stop_after_error_streak)
+        lay.addWidget(limits_box)
+
+        quiet_box = self._settings_card("Quiet Hours")
+        quiet_l = QVBoxLayout(quiet_box)
+        self._quiet_enabled = QCheckBox("Ограничивать фон в локальные тихие часы")
+        self._quiet_enabled.setChecked(bool(comp.get("quiet_hours_enabled", False)))
+        quiet_l.addWidget(self._quiet_enabled)
+        quiet_row = QHBoxLayout()
+        self._quiet_start = QSpinBox()
+        self._quiet_start.setRange(0, 23)
+        self._quiet_start.setValue(max(0, min(23, int(comp.get("quiet_hours_start_hour", 0)))))
+        self._quiet_end = QSpinBox()
+        self._quiet_end.setRange(0, 23)
+        self._quiet_end.setValue(max(0, min(23, int(comp.get("quiet_hours_end_hour", 8)))))
+        quiet_row.addWidget(QLabel("С"))
+        quiet_row.addWidget(self._quiet_start)
+        quiet_row.addWidget(QLabel("до"))
+        quiet_row.addWidget(self._quiet_end)
+        quiet_row.addStretch()
+        quiet_wrap = QWidget()
+        quiet_wrap.setLayout(quiet_row)
+        quiet_l.addWidget(quiet_wrap)
+        quiet_l.addWidget(
+            self._small_hint(
+                "В quiet hours фон не делает сетевые действия. Ручной sync разрешён, но ручная серия ходов всё равно подчиняется лимитам."
+            )
+        )
+        lay.addWidget(quiet_box)
+
+        confirm_box = self._settings_card("Подтверждения и прозрачность")
+        confirm_l = QVBoxLayout(confirm_box)
+        self._confirm_mass_code = QCheckBox("Подтверждать массовый промокод для всех аккаунтов")
+        self._confirm_mass_code.setChecked(bool(comp.get("require_confirm_mass_code", True)))
+        self._confirm_play_session = QCheckBox("Подтверждать ручную серию ходов")
+        self._confirm_play_session.setChecked(bool(comp.get("require_confirm_play_session", True)))
+        confirm_l.addWidget(self._confirm_mass_code)
+        confirm_l.addWidget(self._confirm_play_session)
+        confirm_l.addWidget(
+            self._small_hint(
+                "Мы не пытаемся эмулировать браузерную среду, input-telemetry или официальный Telegram/WebView. "
+                "Режимы выше только уменьшают нагрузку и делают поведение явным для пользователя."
+            )
+        )
+        lay.addWidget(confirm_box)
+
+        lay.addStretch()
         return w
 
     def _tab_notify(self) -> QWidget:
@@ -334,6 +526,12 @@ class SettingsDialog(QDialog):
         }
 
         summary_sec = self._tg_summary.value()
+        gamee = {
+            "transport_backend": str(
+                self._transport_backend.currentData()
+                or GAMEE_TRANSPORT_BACKEND_CURL_CFFI_RAW_HTTP
+            ),
+        }
         telegram = {
             "bot_token": self._tg_token.text().strip(),
             "chat_id": self._tg_chat.text().strip(),
@@ -342,12 +540,27 @@ class SettingsDialog(QDialog):
             "notify_on_season_claim": self._tg_notify_season.isChecked(),
             "summary_interval_seconds": int(summary_sec),
         }
+        compliance = {
+            "background_mode": str(self._bg_mode.currentData() or BACKGROUND_MODE_MANUAL_ONLY),
+            "session_duration_minutes": int(self._session_minutes.value()),
+            "quiet_hours_enabled": self._quiet_enabled.isChecked(),
+            "quiet_hours_start_hour": int(self._quiet_start.value()),
+            "quiet_hours_end_hour": int(self._quiet_end.value()),
+            "daily_move_budget": int(self._daily_move_budget.value()),
+            "max_moves_per_session": int(self._max_moves_session.value()),
+            "error_cooldown_seconds": int(self._error_cooldown.value()),
+            "stop_after_error_streak": int(self._stop_after_error_streak.value()),
+            "require_confirm_mass_code": self._confirm_mass_code.isChecked(),
+            "require_confirm_play_session": self._confirm_play_session.isChecked(),
+        }
 
         try:
             save_config_sections(
                 self._config_path,
+                gamee=gamee,
                 telegram=telegram,
                 telethon=th,
+                compliance=compliance,
             )
         except OSError as e:
             QMessageBox.critical(self, "Сохранение", str(e))

@@ -11,5 +11,6 @@ sessions/
 *.session
 *.har
 .env
+CLAUDE.md
 
 # полный clone для публикации на GitHub (не дублируем в этом репозитории)
