@@ -47,8 +47,14 @@ def ensure_config_file(path: Path) -> None:
             "quiet_hours_enabled": False,
             "quiet_hours_start_hour": 0,
             "quiet_hours_end_hour": 8,
-            "daily_move_budget": 30,
+            "daily_move_budget": 0,
             "max_moves_per_session": 8,
+            "fast_bootstrap_enabled": True,
+            "bootstrap_account_stagger_min_seconds": 0.1,
+            "bootstrap_account_stagger_max_seconds": 0.4,
+            "bootstrap_move_delay_min_seconds": 0.15,
+            "bootstrap_move_delay_max_seconds": 0.45,
+            "steady_energy_targets": [10, 15, 20],
             "error_cooldown_seconds": 30,
             "stop_after_error_streak": 3,
             "require_confirm_mass_code": True,
@@ -232,6 +238,12 @@ class ComplianceConfig:
     quiet_hours_end_hour: int
     daily_move_budget: int
     max_moves_per_session: int
+    fast_bootstrap_enabled: bool
+    bootstrap_account_stagger_min_seconds: float
+    bootstrap_account_stagger_max_seconds: float
+    bootstrap_move_delay_min_seconds: float
+    bootstrap_move_delay_max_seconds: float
+    steady_energy_targets: tuple[int, ...]
     error_cooldown_seconds: int
     stop_after_error_streak: int
     require_confirm_mass_code: bool
@@ -317,6 +329,56 @@ def _int_yaml_default(
     return val
 
 
+def _float_yaml_default(
+    raw: Any,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = float(default)
+    if minimum is not None and val < minimum:
+        val = minimum
+    if maximum is not None and val > maximum:
+        val = maximum
+    return val
+
+
+def _int_tuple_yaml_default(
+    raw: Any,
+    default: tuple[int, ...],
+    *,
+    minimum: int = 1,
+    maximum: int = 200,
+) -> tuple[int, ...]:
+    values: list[int] = []
+    if isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        s = str(raw or "").strip()
+        s = s.strip("[]()")
+        items = [x.strip() for x in s.split(",")] if s else []
+    for item in items:
+        try:
+            n = int(item)
+        except (TypeError, ValueError):
+            continue
+        if minimum <= n <= maximum:
+            values.append(n)
+    # Preserve order, remove duplicates.
+    deduped: list[int] = []
+    seen: set[int] = set()
+    for n in values:
+        if n in seen:
+            continue
+        deduped.append(n)
+        seen.add(n)
+    return tuple(deduped) if deduped else default
+
+
 def load_config(path: Path) -> AppConfig:
     ensure_config_file(path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -386,9 +448,40 @@ def load_config(path: Path) -> AppConfig:
             quiet_hours_end_hour=_int_yaml_default(
                 c.get("quiet_hours_end_hour", 8), 8, minimum=0, maximum=23
             ),
-            daily_move_budget=_int_yaml_default(c.get("daily_move_budget", 30), 30, minimum=1),
+            daily_move_budget=_int_yaml_default(c.get("daily_move_budget", 0), 0, minimum=0),
             max_moves_per_session=_int_yaml_default(
                 c.get("max_moves_per_session", 8), 8, minimum=1
+            ),
+            fast_bootstrap_enabled=bool(c.get("fast_bootstrap_enabled", True)),
+            bootstrap_account_stagger_min_seconds=_float_yaml_default(
+                c.get("bootstrap_account_stagger_min_seconds", 0.1),
+                0.1,
+                minimum=0.0,
+                maximum=30.0,
+            ),
+            bootstrap_account_stagger_max_seconds=_float_yaml_default(
+                c.get("bootstrap_account_stagger_max_seconds", 0.4),
+                0.4,
+                minimum=0.0,
+                maximum=60.0,
+            ),
+            bootstrap_move_delay_min_seconds=_float_yaml_default(
+                c.get("bootstrap_move_delay_min_seconds", 0.15),
+                0.15,
+                minimum=0.0,
+                maximum=30.0,
+            ),
+            bootstrap_move_delay_max_seconds=_float_yaml_default(
+                c.get("bootstrap_move_delay_max_seconds", 0.45),
+                0.45,
+                minimum=0.0,
+                maximum=60.0,
+            ),
+            steady_energy_targets=_int_tuple_yaml_default(
+                c.get("steady_energy_targets", [10, 15, 20]),
+                (10, 15, 20),
+                minimum=5,
+                maximum=200,
             ),
             error_cooldown_seconds=_int_yaml_default(
                 c.get("error_cooldown_seconds", 30), 30, minimum=5

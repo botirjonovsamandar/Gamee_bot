@@ -26,11 +26,11 @@ from gamee_bot.telethon_bridge import clear_init_cache
 _HTTP_RELOGIN_STATUS_CODES = frozenset({401, 419, 498})
 
 # Временные отказы / лимиты — повтор до raise_for_status.
-_RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
+_RETRYABLE_HTTP_STATUS = frozenset({502, 503, 504})
 _MAX_HTTP_TRANSIENT_RETRIES = 4
-_HTTP_REQUEST_MAX_PARALLEL = 8
-_HTTP_REQUEST_START_GAP_SEC = 0.15
-_HTTP_REQUEST_START_JITTER_SEC = 0.30
+_HTTP_REQUEST_MAX_PARALLEL = 12
+_HTTP_REQUEST_START_GAP_SEC = 0.12
+_HTTP_REQUEST_START_JITTER_SEC = 0.18
 
 # Harmless methods that can be added to any batch as "noise" to vary fingerprint.
 _BATCH_NOISE_METHODS = [
@@ -70,13 +70,14 @@ def _api_error_body_hint(raw: str) -> str:
     low = t.lower()
     if "attention required!" in low and "cloudflare" in low:
         return (
-            "Cloudflare WAF (страница «Attention Required»): блок по IP/прокси или без cookie "
-            "после проверки. Попробуй резидентский/другой прокси или запуск без прокси с «чистого» IP."
+            "Cloudflare WAF (страница «Attention Required»): запрос временно ограничен "
+            "или требует браузерную проверку. Прокси может быть рабочим; обычно нужен cooldown "
+            "и меньше одновременных запусков."
         )
     if "cloudflare" in low and "<!doctype html>" in low[:200].lower():
         return (
-            "Cloudflare отдал HTML вместо JSON — запрос распознан как автоматический. "
-            "Смени прокси или сеть."
+            "Cloudflare отдал HTML вместо JSON — запрос временно ограничен/поставлен на проверку. "
+            "Прокси может быть рабочим; нужен cooldown и меньше параллельных логинов."
         )
     return t[:900]
 
@@ -898,6 +899,7 @@ class GameeClient:
                 # ADAPT-1: фиксируем rate-limit для proxy → все аккаунты с него замедлятся
                 proxy_key = self._proxy_url or "_direct"
                 self.__class__._note_rate_limit(proxy_key)
+                r.raise_for_status()
             if code in _RETRYABLE_HTTP_STATUS and attempt + 1 < _MAX_HTTP_TRANSIENT_RETRIES:
                 time.sleep(self._retry_delay_seconds(attempt))
                 continue

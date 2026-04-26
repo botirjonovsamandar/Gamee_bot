@@ -185,8 +185,10 @@ class MainWindow(QMainWindow):
             backend_note = f"backend: {backend} (недоступен: {backend_blocker})"
         else:
             backend_note = f"backend: {backend}"
+        bootstrap = "fast bootstrap: вкл." if c.fast_bootstrap_enabled else "fast bootstrap: выкл."
         self._mode_notice.setText(
-            f"Фоновый режим: {background_mode_label(c.background_mode)}; quiet hours: {quiet}; {backend_note}."
+            f"Фоновый режим: {background_mode_label(c.background_mode)}; quiet hours: {quiet}; "
+            f"{bootstrap}; {backend_note}."
         )
 
     def _ensure_transport_backend_ready(self, title: str) -> bool:
@@ -221,11 +223,16 @@ class MainWindow(QMainWindow):
     def _remaining_manual_moves(self, label: str) -> int:
         if self._cfg is None:
             return 0
+        daily_budget = int(self._cfg.compliance.daily_move_budget)
+        if daily_budget <= 0:
+            return int(self._cfg.compliance.max_moves_per_session)
         used = self._moves_used_today(label)
-        return max(0, int(self._cfg.compliance.daily_move_budget) - used)
+        return max(0, daily_budget - used)
 
     def _consume_manual_moves(self, label: str, delta: int) -> None:
         if delta <= 0:
+            return
+        if self._cfg is not None and int(self._cfg.compliance.daily_move_budget) <= 0:
             return
         key = self._day_key_local()
         used = self._moves_used_today(label)
@@ -373,6 +380,11 @@ class MainWindow(QMainWindow):
         if action == "play_session":
             remaining = self._remaining_manual_moves(label)
             move_limit = min(self._cfg.compliance.max_moves_per_session, remaining)
+            remaining_text = (
+                "без лимита"
+                if int(self._cfg.compliance.daily_move_budget) <= 0
+                else str(remaining)
+            )
             if move_limit <= 0:
                 QMessageBox.information(
                     self,
@@ -386,7 +398,7 @@ class MainWindow(QMainWindow):
                     "Ручная серия ходов",
                     f"Запустить серию ходов для «{label}»?\n"
                     f"Лимит этой сессии: {move_limit}\n"
-                    f"Остаток дневного бюджета: {remaining}\n\n"
+                    f"Остаток дневного бюджета: {remaining_text}\n\n"
                     "Важно: действие выполняется через Telethon + raw HTTP, а не через реальный Telegram WebView/браузер; "
                     "явные маркеры клиента сохраняются.",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

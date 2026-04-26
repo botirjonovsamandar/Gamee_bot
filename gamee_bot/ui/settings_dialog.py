@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -268,8 +269,9 @@ class SettingsDialog(QDialog):
         limits_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self._daily_move_budget = QSpinBox()
-        self._daily_move_budget.setRange(1, 1000)
-        self._daily_move_budget.setValue(max(1, int(comp.get("daily_move_budget", 30))))
+        self._daily_move_budget.setRange(0, 1000)
+        self._daily_move_budget.setSpecialValueText("без лимита")
+        self._daily_move_budget.setValue(max(0, int(comp.get("daily_move_budget", 0))))
 
         self._max_moves_session = QSpinBox()
         self._max_moves_session.setRange(1, 200)
@@ -289,6 +291,60 @@ class SettingsDialog(QDialog):
         limits_form.addRow("Cooldown после серии ошибок:", self._error_cooldown)
         limits_form.addRow("Стоп после ошибок подряд:", self._stop_after_error_streak)
         lay.addWidget(limits_box)
+
+        bootstrap_box = self._settings_card("Быстрый первый проход")
+        bootstrap_l = QVBoxLayout(bootstrap_box)
+        self._fast_bootstrap_enabled = QCheckBox("Быстро слить доступную энергию при запуске фона")
+        self._fast_bootstrap_enabled.setChecked(bool(comp.get("fast_bootstrap_enabled", True)))
+        bootstrap_l.addWidget(self._fast_bootstrap_enabled)
+        bootstrap_l.addWidget(
+            self._small_hint(
+                "Первый проход после «Запустить всё» идёт быстрее: без длинных burst-пауз и без дневного бюджета. "
+                "После слива энергии аккаунт засыпает до случайного порога из списка ниже."
+            )
+        )
+
+        bootstrap_form = QFormLayout()
+        bootstrap_form.setSpacing(12)
+        bootstrap_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        def _seconds_spin(value: float, *, maximum: float = 60.0) -> QDoubleSpinBox:
+            s = QDoubleSpinBox()
+            s.setRange(0.0, maximum)
+            s.setDecimals(1)
+            s.setSingleStep(0.1)
+            s.setSuffix(" сек")
+            s.setValue(float(value))
+            return s
+
+        self._bootstrap_stagger_min = _seconds_spin(
+            float(comp.get("bootstrap_account_stagger_min_seconds", 0.1))
+        )
+        self._bootstrap_stagger_max = _seconds_spin(
+            float(comp.get("bootstrap_account_stagger_max_seconds", 0.4))
+        )
+        self._bootstrap_move_delay_min = _seconds_spin(
+            float(comp.get("bootstrap_move_delay_min_seconds", 0.15))
+        )
+        self._bootstrap_move_delay_max = _seconds_spin(
+            float(comp.get("bootstrap_move_delay_max_seconds", 0.45))
+        )
+        targets = comp.get("steady_energy_targets", [10, 15, 20])
+        if isinstance(targets, (list, tuple)):
+            targets_text = ",".join(str(int(x)) for x in targets if str(x).strip())
+        else:
+            targets_text = str(targets or "10,15,20")
+        self._steady_energy_targets = QLineEdit()
+        self._steady_energy_targets.setPlaceholderText("Например: 10,15,20")
+        self._steady_energy_targets.setText(targets_text)
+
+        bootstrap_form.addRow("Старт аккаунтов от:", self._bootstrap_stagger_min)
+        bootstrap_form.addRow("Старт аккаунтов до:", self._bootstrap_stagger_max)
+        bootstrap_form.addRow("Пауза между ходами от:", self._bootstrap_move_delay_min)
+        bootstrap_form.addRow("Пауза между ходами до:", self._bootstrap_move_delay_max)
+        bootstrap_form.addRow("Пороги возврата:", self._steady_energy_targets)
+        bootstrap_l.addLayout(bootstrap_form)
+        lay.addWidget(bootstrap_box)
 
         quiet_box = self._settings_card("Quiet Hours")
         quiet_l = QVBoxLayout(quiet_box)
@@ -519,6 +575,45 @@ class SettingsDialog(QDialog):
             "telegram_referral_ref": telegram_referral_ref,
         }
 
+        steady_targets: list[int] = []
+        for part in self._steady_energy_targets.text().replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                n = int(part)
+            except ValueError:
+                QMessageBox.warning(
+                    self,
+                    "Пороги возврата",
+                    "Пороги возврата должны быть числами через запятую, например 10,15,20.",
+                )
+                return
+            if n < 5:
+                QMessageBox.warning(
+                    self,
+                    "Пороги возврата",
+                    "Минимальный порог возврата — 5 энергии, иначе ход невозможен.",
+                )
+                return
+            steady_targets.append(n)
+        if not steady_targets:
+            QMessageBox.warning(
+                self,
+                "Пороги возврата",
+                "Укажите хотя бы один порог возврата, например 10,15,20.",
+            )
+            return
+
+        bs_stagger_min = float(self._bootstrap_stagger_min.value())
+        bs_stagger_max = float(self._bootstrap_stagger_max.value())
+        bs_move_min = float(self._bootstrap_move_delay_min.value())
+        bs_move_max = float(self._bootstrap_move_delay_max.value())
+        if bs_stagger_min > bs_stagger_max:
+            bs_stagger_min, bs_stagger_max = bs_stagger_max, bs_stagger_min
+        if bs_move_min > bs_move_max:
+            bs_move_min, bs_move_max = bs_move_max, bs_move_min
+
         summary_sec = self._tg_summary.value()
         gamee = {
             "transport_backend": str(
@@ -542,6 +637,12 @@ class SettingsDialog(QDialog):
             "quiet_hours_end_hour": int(self._quiet_end.value()),
             "daily_move_budget": int(self._daily_move_budget.value()),
             "max_moves_per_session": int(self._max_moves_session.value()),
+            "fast_bootstrap_enabled": self._fast_bootstrap_enabled.isChecked(),
+            "bootstrap_account_stagger_min_seconds": bs_stagger_min,
+            "bootstrap_account_stagger_max_seconds": bs_stagger_max,
+            "bootstrap_move_delay_min_seconds": bs_move_min,
+            "bootstrap_move_delay_max_seconds": bs_move_max,
+            "steady_energy_targets": steady_targets,
             "error_cooldown_seconds": int(self._error_cooldown.value()),
             "stop_after_error_streak": int(self._stop_after_error_streak.value()),
             "require_confirm_mass_code": self._confirm_mass_code.isChecked(),

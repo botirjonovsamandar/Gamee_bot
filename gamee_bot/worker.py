@@ -115,19 +115,25 @@ def _post_daily_idle() -> float:
 # Пауза между стартом потоков аккаунтов (порядок как в accounts.yaml), чтобы не вшмыть API/UI разом.
 # Conservative stagger: official-grade pacing between account thread starts.
 def _account_stagger_delay() -> float:
-    """Минимальный stagger между запусками потоков аккаунтов (0-0.4с).
-
-    Раньше было 2-30с (gamma) — пользователь жалуется что долго ждёт.
-    Теперь почти сразу: 0-0.4с просто чтобы не было точного бурста запросов.
-    """
-    return random.uniform(0.0, 0.4)
+    """Stagger между запуском потоков аккаунтов, чтобы loginUsingTelegram не шёл бурстом."""
+    return random.uniform(0.5, 2.5)
 
 
 # Одновременно не более N потоков аккаунтов в rewardedProgress (иначе прокси/API «задыхаются», все в SSL read).
 _SEASON_API_MAX_PARALLEL = 5
 _MAX_ERROR_BACKOFF_SEC = 90.0
+_RATE_LIMIT_RETRY_IDLE_SEC = (300.0, 720.0)
 _SEASON_SYNC_MIN_INTERVAL_SEC = 45.0
 _IDLE_JITTER_SEC = 3.0
+
+
+def _looks_like_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "http 429" in msg
+        or "cloudflare отдал html" in msg
+        or "cloudflare waf" in msg
+    )
 
 
 def _regen_wait_slack() -> float:
@@ -145,6 +151,19 @@ STATUS_DAILY_DONE = "ежедневная награда выполнена"
 STATUS_MOVE_IN_PROGRESS = "бросок кубика…"
 STATUS_MOVE_DONE = "ход выполнен"
 STATUS_SLEEPING = "сон до регена"
+STATUS_BOOTSTRAP = "быстрый первый проход"
+STATUS_REGEN_WAIT = "ожидание регена"
+
+
+def _format_wait_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, sec = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}ч {minutes:02d}м"
+    if minutes > 0:
+        return f"{minutes}м {sec:02d}с"
+    return f"{sec}с"
 
 
 @dataclass
@@ -232,6 +251,13 @@ class BotWorker(QThread):
         self._speed_state: dict[str, MarkovSpeedState] = {}
         # Запланированные вторые сессии (BEH-8): label -> monotonic time когда играть снова
         self._second_session_at: dict[str, float] = {}
+        # Fast bootstrap: на каждом запуске сначала быстро сливаем текущую энергию,
+        # затем аккаунты живут по steady target без лишних API-запросов.
+        self._bootstrap_pending_labels: set[str] = set()
+        self._bootstrap_started_labels: set[str] = set()
+        self._bootstrap_done_labels: set[str] = set()
+        self._steady_energy_target_by_label: dict[str, int] = {}
+        self._bootstrap_notice_emitted = False
         # TG-1 poller (фоновые getMe/get_dialogs)
         self._tg_poller: Any = None
 
@@ -266,7 +292,7 @@ class BotWorker(QThread):
             return 999.0
 
     def _personal_daily_budget(self, label: str) -> int:
-        """Daily budget с per-account variance ±30% × warmup multiplier (BEH-7)."""
+        """Daily budget с variance; 0 в config означает без дневного лимита."""
         base = self._cfg.compliance.daily_move_budget
         if base <= 0:
             return 0
@@ -274,6 +300,135 @@ class BotWorker(QThread):
         variance = daily_budget_multiplier(label, date_str)
         warmup = warmup_multiplier(self._account_age_days(label))
         return max(1, int(base * variance * warmup))
+
+    def _fast_bootstrap_enabled(self) -> bool:
+        return bool(self._cfg.compliance.fast_bootstrap_enabled)
+
+    @staticmethod
+    def _ordered_float_range(lo: float, hi: float) -> tuple[float, float]:
+        a = max(0.0, float(lo))
+        b = max(0.0, float(hi))
+        return (a, b) if a <= b else (b, a)
+
+    def _account_stagger_delay_for_label(self, label: str) -> float:
+        if self._is_bootstrap_pending(label):
+            c = self._cfg.compliance
+            lo, hi = self._ordered_float_range(
+                c.bootstrap_account_stagger_min_seconds,
+                c.bootstrap_account_stagger_max_seconds,
+            )
+            return random.uniform(lo, hi)
+        return _account_stagger_delay()
+
+    def _bootstrap_move_delay(self) -> float:
+        c = self._cfg.compliance
+        lo, hi = self._ordered_float_range(
+            c.bootstrap_move_delay_min_seconds,
+            c.bootstrap_move_delay_max_seconds,
+        )
+        return random.uniform(lo, hi)
+
+    def _steady_targets(self) -> tuple[int, ...]:
+        targets = tuple(
+            int(x)
+            for x in self._cfg.compliance.steady_energy_targets
+            if int(x) >= ENERGY_COST_PER_MOVE
+        )
+        return targets or MIN_ENERGY_TO_PLAY_OPTIONS
+
+    def _choose_steady_energy_target(self, label: str) -> int:
+        target = int(random.choice(self._steady_targets()))
+        with self._state_lock:
+            self._steady_energy_target_by_label[label] = target
+        return target
+
+    def _steady_energy_target_for_label(self, label: str) -> int:
+        with self._state_lock:
+            target = self._steady_energy_target_by_label.get(label)
+        if target is not None and target >= ENERGY_COST_PER_MOVE:
+            return int(target)
+        return self._choose_steady_energy_target(label)
+
+    def _is_bootstrap_pending(self, label: str) -> bool:
+        if not self._fast_bootstrap_enabled():
+            return False
+        with self._state_lock:
+            return label in self._bootstrap_pending_labels
+
+    def _mark_bootstrap_started(self, label: str) -> bool:
+        if not self._fast_bootstrap_enabled():
+            return False
+        with self._state_lock:
+            if label not in self._bootstrap_pending_labels:
+                return False
+            if label in self._bootstrap_started_labels:
+                return False
+            self._bootstrap_started_labels.add(label)
+            return True
+
+    def _sleep_seconds_until_energy(
+        self,
+        *,
+        current_energy: int,
+        target_energy: int,
+        regen_deadline_utc: datetime | None,
+    ) -> float:
+        if current_energy >= target_energy:
+            return random.uniform(*_READY_TO_PLAY_JITTER_SEC)
+        now = datetime.now(timezone.utc)
+        if regen_deadline_utc is None:
+            need = max(1, target_energy - current_energy)
+            return float(need * ENERGY_REGEN_MINUTES * 60) + _regen_wait_slack()
+        at = regen_deadline_utc
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        energy_after_next = current_energy + 1
+        still_need = max(0, target_energy - energy_after_next)
+        sec_to_next = max(0.0, (at - now).total_seconds())
+        return float(sec_to_next + still_need * ENERGY_REGEN_MINUTES * 60) + _regen_wait_slack()
+
+    def _set_row_status(self, label: str, status: str) -> None:
+        with self._state_lock:
+            row = self._rows.get(label)
+            if row is None:
+                return
+            row.status = status
+            self._rows[label] = row
+
+    def _complete_bootstrap_if_pending(
+        self,
+        label: str,
+        state: AccountGameState,
+    ) -> None:
+        if not self._fast_bootstrap_enabled():
+            return
+        with self._state_lock:
+            if label not in self._bootstrap_pending_labels:
+                return
+            self._bootstrap_pending_labels.discard(label)
+            self._bootstrap_done_labels.add(label)
+        target = self._choose_steady_energy_target(label)
+        wait = self._sleep_seconds_until_energy(
+            current_energy=state.energy,
+            target_energy=target,
+            regen_deadline_utc=state.next_live_at_utc,
+        )
+        self._set_row_status(
+            label,
+            f"{STATUS_REGEN_WAIT} до {target} энергии (~{_format_wait_duration(wait)})",
+        )
+        self.log_message.emit(
+            f"[{label}] Bootstrap: энергия слита, следующий возврат при "
+            f"{target} энергии через ~{_format_wait_duration(wait)}."
+        )
+
+    def _note_steady_wakeup_if_due(self, label: str, current_energy: int) -> int | None:
+        with self._state_lock:
+            target = self._steady_energy_target_by_label.get(label)
+            if target is None or current_energy < target:
+                return None
+            del self._steady_energy_target_by_label[label]
+        return target
 
     def _daily_moves_used(self, label: str) -> int:
         key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -420,6 +575,10 @@ class BotWorker(QThread):
             return True
         return False
 
+    @staticmethod
+    def _row_is_rate_limited(row: RowState) -> bool:
+        return _looks_like_rate_limit_error(RuntimeError(row.last_error or row.status))
+
     def _idle_sleep_seconds_for_row(self, label: str, row: RowState) -> float:
         """Пауза аккаунта до следующего цикла.
 
@@ -428,6 +587,9 @@ class BotWorker(QThread):
         (regen_deadline_utc) как базу, дальше считаем сколько ещё нужно.
         Не дёргаем API во время сна.
         """
+        if self._row_is_rate_limited(row):
+            return random.uniform(*_RATE_LIMIT_RETRY_IDLE_SEC)
+
         if self._row_needs_quick_retry_after_error(row):
             streak = max(1, self._error_streaks.get(label, 1))
             prev = self._last_error_delay.get(label, _ERROR_RETRY_IDLE_SEC)
@@ -436,29 +598,43 @@ class BotWorker(QThread):
             self._last_error_delay[label] = delay
             return delay
 
-        threshold = play_energy_threshold_for_label(label)
-        now = datetime.now(timezone.utc)
+        bootstrap = self._is_bootstrap_pending(label)
+        threshold = (
+            ENERGY_COST_PER_MOVE
+            if bootstrap
+            else self._steady_energy_target_for_label(label)
+        )
 
         # Энергия уже >= порога — играть почти сразу (1-3с jitter).
         if row.energy >= threshold:
-            return random.uniform(*_READY_TO_PLAY_JITTER_SEC)
+            return (
+                random.uniform(0.1, 0.8)
+                if bootstrap
+                else random.uniform(*_READY_TO_PLAY_JITTER_SEC)
+            )
 
-        # Нет nextLive от сервера — аварийный фолбек.
-        if row.regen_deadline_utc is None:
-            need = max(1, threshold - row.energy)
-            return float(need * ENERGY_REGEN_MINUTES * 60) + _regen_wait_slack()
-
-        # Есть nextLive — это время, когда добавится СЛЕДУЮЩАЯ 1 энергия.
-        at = row.regen_deadline_utc
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=timezone.utc)
-        # Сколько ещё энергий нужно сверх той одной, что придёт в nextLive.
-        energy_after_next = row.energy + 1
-        still_need = max(0, threshold - energy_after_next)
-        # Время до nextLive + оставшиеся регены + jitter.
-        sec_to_next = max(0.0, (at - now).total_seconds())
-        total_sleep = sec_to_next + still_need * ENERGY_REGEN_MINUTES * 60
-        return float(total_sleep) + _regen_wait_slack()
+        delay = self._sleep_seconds_until_energy(
+            current_energy=row.energy,
+            target_energy=threshold,
+            regen_deadline_utc=row.regen_deadline_utc,
+        )
+        if bootstrap and row.energy < ENERGY_COST_PER_MOVE:
+            state = AccountGameState(
+                energy=row.energy,
+                gold=row.gold,
+                tickets=0,
+                usd_cents=row.usd_cents,
+                gold_estimated_usd=row.gold_estimated_usd,
+                last_error=row.last_error or None,
+                next_live_at_utc=row.regen_deadline_utc,
+            )
+            self._complete_bootstrap_if_pending(label, state)
+        else:
+            self._set_row_status(
+                label,
+                f"{STATUS_REGEN_WAIT} до {threshold} энергии (~{_format_wait_duration(delay)})",
+            )
+        return delay
 
     def _join_finished_threads(self, alive_labels: set[str]) -> None:
         for dead in list(self._account_threads.keys()):
@@ -490,6 +666,11 @@ class BotWorker(QThread):
         self._speed_state.clear()
         self._second_session_at.clear()
         self._season_sync_due_at.clear()
+        self._bootstrap_pending_labels.clear()
+        self._bootstrap_started_labels.clear()
+        self._bootstrap_done_labels.clear()
+        self._steady_energy_target_by_label.clear()
+        self._bootstrap_notice_emitted = False
         # Per-session mood: настроение этого запуска (good/neutral/bad)
         self._session_mood = roll_mood()
         self.log_message.emit(f"Сессия запущена: настроение = {self._session_mood.name}.")
@@ -518,6 +699,11 @@ class BotWorker(QThread):
                         self._error_streaks.clear()
                         self._error_cooldown_until.clear()
                         self._season_sync_due_at.clear()
+                        self._bootstrap_pending_labels.clear()
+                        self._bootstrap_started_labels.clear()
+                        self._bootstrap_done_labels.clear()
+                        self._steady_energy_target_by_label.clear()
+                        self._bootstrap_notice_emitted = False
                         self._wake_labels.clear()
                     self._emit_table()
                     self._sleep_interruptible(10.0)
@@ -534,6 +720,10 @@ class BotWorker(QThread):
                             self._error_streaks.pop(dead, None)
                             self._error_cooldown_until.pop(dead, None)
                             self._season_sync_due_at.pop(dead, None)
+                            self._bootstrap_pending_labels.discard(dead)
+                            self._bootstrap_started_labels.discard(dead)
+                            self._bootstrap_done_labels.discard(dead)
+                            self._steady_energy_target_by_label.pop(dead, None)
                             self._wake_labels.pop(dead, None)
                     for dead in list(self._sessions.keys()):
                         if dead not in alive_labels:
@@ -541,8 +731,27 @@ class BotWorker(QThread):
                             self._error_streaks.pop(dead, None)
                             self._error_cooldown_until.pop(dead, None)
                             self._season_sync_due_at.pop(dead, None)
+                            self._bootstrap_pending_labels.discard(dead)
+                            self._bootstrap_started_labels.discard(dead)
+                            self._bootstrap_done_labels.discard(dead)
+                            self._steady_energy_target_by_label.pop(dead, None)
                             self._wake_labels.pop(dead, None)
                     for acc in accounts:
+                        if self._fast_bootstrap_enabled():
+                            if (
+                                acc.label not in self._bootstrap_pending_labels
+                                and acc.label not in self._bootstrap_done_labels
+                            ):
+                                self._bootstrap_pending_labels.add(acc.label)
+                                if not self._bootstrap_notice_emitted:
+                                    self.log_message.emit(
+                                        "Быстрый первый проход: старт. "
+                                        "Аккаунты быстро выполнят действия и затем перейдут в ожидание регена."
+                                    )
+                                    self._bootstrap_notice_emitted = True
+                        else:
+                            self._bootstrap_pending_labels.discard(acc.label)
+                            self._bootstrap_started_labels.discard(acc.label)
                         if acc.label not in self._rows:
                             self._rows[acc.label] = RowState(
                                 label=acc.label,
@@ -563,7 +772,9 @@ class BotWorker(QThread):
                     self._account_threads[acc.label] = t
                     t.start()
                     if i + 1 < len(pending_start):
-                        self._sleep_interruptible(_account_stagger_delay())
+                        self._sleep_interruptible(
+                            self._account_stagger_delay_for_label(acc.label)
+                        )
 
                 self._emit_table()
 
@@ -651,24 +862,36 @@ class BotWorker(QThread):
                 try:
                     self._sync_account(client, notifier, acc)
                 except Exception as e:
-                    self.log_message.emit(
-                        f"[{label}] Сбой цикла аккаунта (продолжаем попытки): "
-                        f"{e}\n{traceback.format_exc()}"
-                    )
+                    if _looks_like_rate_limit_error(e):
+                        self.log_message.emit(
+                            f"[{label}] Cloudflare/429: {e} Повторим позже без смены прокси."
+                        )
+                    else:
+                        self.log_message.emit(
+                            f"[{label}] Сбой цикла аккаунта (продолжаем попытки): "
+                            f"{e}\n{traceback.format_exc()}"
+                        )
                     with self._state_lock:
                         row = self._rows.get(label) or RowState(
                             label=label, energy=0, gold=0, usd_cents=0
                         )
-                        row.status = "сбой цикла"
+                        row.status = (
+                            "Cloudflare/429 cooldown"
+                            if _looks_like_rate_limit_error(e)
+                            else "сбой цикла"
+                        )
                         row.last_error = str(e).strip() or repr(e)
                         self._rows[label] = row
                     self._note_account_error(label)
                     self._emit_table()
-                    self._sleep_interruptible(15.0, label=label)
+                    idle = self._idle_sleep_seconds_for_row(label, row)
+                    self._emit_table()
+                    self._sleep_interruptible(idle, label=label)
                     continue
                 with self._state_lock:
                     row = self._rows.get(label)
                 idle = self._idle_sleep_seconds_for_row(label, row) if row is not None else 10.0
+                self._emit_table()
                 self._sleep_interruptible(idle, label=label)
         finally:
             if client is not None:
@@ -700,6 +923,7 @@ class BotWorker(QThread):
         label: str,
         *,
         allow_claim: bool,
+        fast: bool = False,
     ) -> None:
         snap = client.get_daily_checkin_snapshot(session)
         day_key_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -764,11 +988,12 @@ class BotWorker(QThread):
                         row.status = STATUS_DAILY_DONE
                         self._rows[label] = row
                 self._emit_table()
-                self._sleep_interruptible(_post_daily_idle(), label=label)
+                if not fast:
+                    self._sleep_interruptible(_post_daily_idle(), label=label)
                 with self._state_lock:
                     row = self._rows.get(label)
                     if row is not None:
-                        row.status = STATUS_IDLE
+                        row.status = STATUS_BOOTSTRAP if fast else STATUS_IDLE
                         self._rows[label] = row
                 self._emit_table()
             else:
@@ -908,6 +1133,17 @@ class BotWorker(QThread):
                 self._rows[label] = row
             self._emit_table()
             return
+        bootstrap = self._is_bootstrap_pending(label)
+        if self._mark_bootstrap_started(label):
+            with self._state_lock:
+                row = self._rows.get(label) or RowState(
+                    label=label, energy=0, gold=0, usd_cents=0
+                )
+                row.proxy_cell = px_cell
+                row.proxy_tooltip = px_tip
+                row.status = STATUS_BOOTSTRAP
+                self._rows[label] = row
+            self._emit_table()
         try:
             session = self._session_for(acc)
             with self._state_lock:
@@ -971,7 +1207,7 @@ class BotWorker(QThread):
                         err = err[:117] + "..."
                     row.status = f"ошибка: {err}"
                 else:
-                    row.status = STATUS_IDLE
+                    row.status = STATUS_BOOTSTRAP if bootstrap else STATUS_IDLE
                 self._rows[label] = row
 
             if not state.last_error:
@@ -992,6 +1228,7 @@ class BotWorker(QThread):
                         session,
                         label,
                         allow_claim=self._background_mode_allows_claims(),
+                        fast=bootstrap,
                     )
                 else:
                     self._apply_daily_checkin(
@@ -999,6 +1236,7 @@ class BotWorker(QThread):
                         session,
                         label,
                         allow_claim=self._background_mode_allows_claims(),
+                        fast=bootstrap,
                     )
                     self._apply_season_pass(
                         client,
@@ -1015,6 +1253,7 @@ class BotWorker(QThread):
                     session,
                     label,
                     allow_claim=self._background_mode_allows_claims(),
+                    fast=bootstrap,
                 )
 
             if state.last_error:
@@ -1039,8 +1278,18 @@ class BotWorker(QThread):
                 else:
                     self._note_account_error(label)
 
-            threshold = play_energy_threshold_for_label(label)
+            bootstrap = self._is_bootstrap_pending(label)
+            reached_steady_target: int | None = None
+            if not bootstrap:
+                reached_steady_target = self._note_steady_wakeup_if_due(label, state.energy)
+            threshold = (
+                ENERGY_COST_PER_MOVE
+                if bootstrap
+                else reached_steady_target or self._steady_energy_target_for_label(label)
+            )
             if state.energy < threshold:
+                if bootstrap and state.energy < ENERGY_COST_PER_MOVE:
+                    self._complete_bootstrap_if_pending(label, state)
                 self._emit_table()
                 return
 
@@ -1060,13 +1309,18 @@ class BotWorker(QThread):
 
             # ── Play board loop ──
             # Дневной бюджет с per-account variance ±30%
-            daily_budget = self._personal_daily_budget(label)
+            daily_budget = 0 if bootstrap else self._personal_daily_budget(label)
             # BEH-2: Burst plan — разбиваем ходы на серии с длинными паузами между ними
             estimated_moves = max(1, state.energy // ENERGY_COST_PER_MOVE)
-            burst_plan = plan_burst_schedule(estimated_moves)
+            burst_plan = (
+                BurstPlan(bursts=(estimated_moves,), pauses=())
+                if bootstrap
+                else plan_burst_schedule(estimated_moves)
+            )
             burst_idx = 0
             moves_in_current_burst = 0
             move_idx = 0
+            series_interrupted = False
             while self._running and state.energy >= ENERGY_COST_PER_MOVE:
                 if daily_budget > 0 and self._daily_moves_used(label) >= daily_budget:
                     self.log_message.emit(
@@ -1082,11 +1336,13 @@ class BotWorker(QThread):
                         self.log_message.emit(
                             f"[{label}] Прокси в accounts.yaml: {e} — прерываю серию ходов."
                         )
+                        series_interrupted = True
                         break
                     if want_p != client.proxy_url:
                         self.log_message.emit(
                             f"[{label}] Прокси изменён — переподключение с новым каналом."
                         )
+                        series_interrupted = True
                         break
 
                 move_idx += 1
@@ -1094,19 +1350,30 @@ class BotWorker(QThread):
                     row = self._rows.get(label) or RowState(
                         label=label, energy=0, gold=0, usd_cents=0
                     )
-                    row.status = STATUS_MOVE_IN_PROGRESS
+                    row.status = (
+                        f"{STATUS_BOOTSTRAP}: {STATUS_MOVE_IN_PROGRESS}"
+                        if bootstrap
+                        else STATUS_MOVE_IN_PROGRESS
+                    )
                     self._rows[label] = row
                 self._emit_table()
 
-                # Human-like: brief thinking pause before tapping "Play"
-                self._sleep_interruptible(self._personalized_pre_move_delay(label), label=label)
+                if bootstrap:
+                    self._sleep_interruptible(random.uniform(0.05, 0.15), label=label)
+                else:
+                    # Human-like: brief thinking pause before tapping "Play"
+                    self._sleep_interruptible(
+                        self._personalized_pre_move_delay(label),
+                        label=label,
+                    )
                 if not self._running:
                     break
 
-                # Имитация tap-события на кнопку Play (телеметрия + реалистичная задержка)
-                client.simulate_play_tap(session)
-                if not self._running:
-                    break
+                if not bootstrap:
+                    # Имитация tap-события на кнопку Play (телеметрия + реалистичная задержка)
+                    client.simulate_play_tap(session)
+                    if not self._running:
+                        break
 
                 outcome = client.play_board(session)
                 if not outcome.ok:
@@ -1122,6 +1389,7 @@ class BotWorker(QThread):
                         f"[{label}] Бросок кубика #{move_idx}: не удалось — {outcome.error}"
                     )
                     self._emit_table()
+                    series_interrupted = True
                     break
 
                 before = outcome.before
@@ -1140,7 +1408,11 @@ class BotWorker(QThread):
                     row.last_error = after.last_error or ""
                     row.regen_deadline_utc = after.next_live_at_utc
                     row.last_move_at = ts
-                    row.status = STATUS_MOVE_DONE
+                    row.status = (
+                        f"{STATUS_BOOTSTRAP}: {STATUS_MOVE_DONE}"
+                        if bootstrap
+                        else STATUS_MOVE_DONE
+                    )
                     self._rows[label] = row
 
                 self._note_account_success(label)
@@ -1161,7 +1433,7 @@ class BotWorker(QThread):
                     after.tickets - before.tickets,
                     outcome.xp_gained,
                 )
-                if not after.last_error:
+                if not bootstrap and not after.last_error:
                     self._apply_season_pass(
                         client,
                         session,
@@ -1173,44 +1445,59 @@ class BotWorker(QThread):
 
                 if not self._running:
                     break
-                # BEH-2: Если завершён текущий burst — длинная пауза перед следующим
-                moves_in_current_burst += 1
-                if (
-                    burst_idx < len(burst_plan.bursts)
-                    and moves_in_current_burst >= burst_plan.bursts[burst_idx]
-                    and burst_idx < len(burst_plan.pauses)
-                ):
-                    pause = burst_plan.pauses[burst_idx]
-                    self.log_message.emit(
-                        f"[{label}] Burst #{burst_idx+1} done — long pause {pause:.0f}s."
-                    )
-                    self._sleep_interruptible(pause, label=label)
-                    burst_idx += 1
-                    moves_in_current_burst = 0
+                if bootstrap:
+                    self._sleep_interruptible(self._bootstrap_move_delay(), label=label)
                 else:
-                    # Human-like: watch dice animation + check rewards (Pareto × personality × mood × Markov)
-                    self._sleep_interruptible(self._personalized_move_delay(label), label=label)
+                    # BEH-2: Если завершён текущий burst — длинная пауза перед следующим
+                    moves_in_current_burst += 1
+                    if (
+                        burst_idx < len(burst_plan.bursts)
+                        and moves_in_current_burst >= burst_plan.bursts[burst_idx]
+                        and burst_idx < len(burst_plan.pauses)
+                    ):
+                        pause = burst_plan.pauses[burst_idx]
+                        self.log_message.emit(
+                            f"[{label}] Burst #{burst_idx+1} done — long pause {pause:.0f}s."
+                        )
+                        self._sleep_interruptible(pause, label=label)
+                        burst_idx += 1
+                        moves_in_current_burst = 0
+                    else:
+                        # Human-like: watch dice animation + check rewards (Pareto × personality × mood × Markov)
+                        self._sleep_interruptible(
+                            self._personalized_move_delay(label),
+                            label=label,
+                        )
                 with self._state_lock:
                     row = self._rows.get(label) or RowState(
                         label=label, energy=0, gold=0, usd_cents=0
                     )
-                    row.status = STATUS_IDLE
+                    row.status = STATUS_BOOTSTRAP if bootstrap else STATUS_IDLE
                     self._rows[label] = row
                 self._emit_table()
                 if state.energy < ENERGY_COST_PER_MOVE:
                     break
 
+            if bootstrap and not series_interrupted and state.energy < ENERGY_COST_PER_MOVE:
+                self._complete_bootstrap_if_pending(label, state)
+                self._emit_table()
             return
         except Exception as e:
+            rate_limited = _looks_like_rate_limit_error(e)
             with self._state_lock:
                 row = self._rows.get(label) or RowState(
                     label=label, energy=0, gold=0, usd_cents=0
                 )
-                row.status = "исключение"
+                row.status = "Cloudflare/429 cooldown" if rate_limited else "исключение"
                 row.last_error = str(e)
                 self._rows[label] = row
             self._note_account_error(label)
-            self.log_message.emit(f"[{label}] {e}\n{traceback.format_exc()}")
+            if rate_limited:
+                self.log_message.emit(
+                    f"[{label}] Cloudflare/429: {e} Повторим позже без смены прокси."
+                )
+            else:
+                self.log_message.emit(f"[{label}] {e}\n{traceback.format_exc()}")
             self._emit_table()
 
     def _ordered_row_states(self) -> list[RowState]:
