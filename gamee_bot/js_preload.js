@@ -330,7 +330,24 @@ var document = {
   contentType: "text/html",
   compatMode: "CSS1Compat",
 
-  createElement: function(tag) { return _makeElement(tag); },
+  createElement: function(tag) {
+    var el = _makeElement(tag);
+    var lt = String(tag || "").toLowerCase();
+    // Canvas: дать ему getContext с реальным WebGL/2D stub (как HTMLCanvasElement.prototype)
+    if (lt === "canvas") {
+      try {
+        if (window.HTMLCanvasElement && window.HTMLCanvasElement.prototype) {
+          var proto = window.HTMLCanvasElement.prototype;
+          el.getContext = proto.getContext || function() { return null; };
+          el.toDataURL = proto.toDataURL || function() { return "data:image/png;base64,"; };
+          el.toBlob = proto.toBlob || function(cb) { try { cb(null); } catch(e){} };
+          el.width = el.width || 300;
+          el.height = el.height || 150;
+        }
+      } catch (e) {}
+    }
+    return el;
+  },
   createElementNS: function(ns, tag) { return _makeElement(tag); },
   createTextNode: function(t) { return { nodeType: 3, textContent: t, data: t }; },
   createDocumentFragment: function() {
@@ -459,9 +476,12 @@ window.HTMLCanvasElement.prototype = {
     if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
       return {
         getParameter: function(p) {
-          // RENDERER / VENDOR for WebGL fingerprint
-          if (p === 0x1F01) return "Adreno (TM) 730";
-          if (p === 0x1F00) return "Qualcomm";
+          // RENDERER / VENDOR for WebGL fingerprint (per-account from __SANDBOX_WEBGL_PARAMS__)
+          var params = window.__SANDBOX_WEBGL_PARAMS__ || {};
+          if (p === 0x1F01) return params["RENDERER"] || "Adreno (TM) 730";
+          if (p === 0x1F00) return params["VENDOR"] || "Qualcomm";
+          if (p === 0x9246) return params[37446] || params["RENDERER"] || "Adreno (TM) 730";
+          if (p === 0x9245) return params[37445] || params["VENDOR"] || "Qualcomm";
           return null;
         },
         getExtension: function(name) {
@@ -644,5 +664,127 @@ _g.HTMLCanvasElement = window.HTMLCanvasElement;
 _g.WebGLRenderingContext = window.WebGLRenderingContext;
 _g.WebGL2RenderingContext = window.WebGL2RenderingContext;
 _g.Telegram = window.Telegram;
+
+// ── Phase 15: Extended browser API stubs ─────────────────────────────
+
+// JS-3: WebRTC stubs (RTCPeerConnection)
+window.RTCPeerConnection = window.RTCPeerConnection || function() {
+  this.localDescription = null;
+  this.remoteDescription = null;
+  this.signalingState = "stable";
+  this.connectionState = "new";
+  this.iceConnectionState = "new";
+  this.iceGatheringState = "new";
+  this.createOffer = function() { return Promise.resolve({ type: "offer", sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n" }); };
+  this.createAnswer = function() { return Promise.resolve({ type: "answer", sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n" }); };
+  this.setLocalDescription = function(d) { this.localDescription = d; return Promise.resolve(); };
+  this.setRemoteDescription = function(d) { this.remoteDescription = d; return Promise.resolve(); };
+  this.addIceCandidate = function() { return Promise.resolve(); };
+  this.getStats = function() { return Promise.resolve(new Map()); };
+  this.close = function() { this.connectionState = "closed"; };
+  this.addEventListener = function() {};
+  this.removeEventListener = function() {};
+};
+window.webkitRTCPeerConnection = window.RTCPeerConnection;
+window.RTCSessionDescription = function(d) { Object.assign(this, d || {}); };
+window.RTCIceCandidate = function(d) { Object.assign(this, d || {}); };
+
+// JS-4: console buffering (вместо noop) — challenge JS может это проверять
+(function() {
+  var buf = [];
+  ["log", "info", "warn", "error", "debug", "trace"].forEach(function(method) {
+    var orig = console[method] || function() {};
+    console[method] = function() {
+      try {
+        buf.push({ method: method, args: Array.prototype.slice.call(arguments), ts: Date.now() });
+        if (buf.length > 200) buf.shift();
+      } catch (e) {}
+      return orig.apply(console, arguments);
+    };
+  });
+  console.__buffer = function() { return buf.slice(); };
+})();
+
+// JS-7: DeviceMotion / DeviceOrientation stubs
+window.DeviceMotionEvent = window.DeviceMotionEvent || function(t) { this.type = t || "devicemotion"; };
+window.DeviceOrientationEvent = window.DeviceOrientationEvent || function(t) { this.type = t || "deviceorientation"; };
+if (window.DeviceMotionEvent.requestPermission === undefined) {
+  window.DeviceMotionEvent.requestPermission = function() { return Promise.resolve("granted"); };
+}
+if (window.DeviceOrientationEvent.requestPermission === undefined) {
+  window.DeviceOrientationEvent.requestPermission = function() { return Promise.resolve("granted"); };
+}
+
+// JS: Permissions API
+navigator.permissions = navigator.permissions || {
+  query: function(desc) {
+    var name = (desc && desc.name) || "";
+    // Реалистичные дефолты для Android Telegram WebView
+    var states = {
+      notifications: "prompt",
+      geolocation: "denied",
+      camera: "denied",
+      microphone: "denied",
+      "persistent-storage": "granted",
+      "background-sync": "granted",
+    };
+    var state = states[name] || "prompt";
+    return Promise.resolve({ state: state, addEventListener: function() {}, removeEventListener: function() {} });
+  }
+};
+
+// JS-10: Telegram.WebApp.HapticFeedback (имитация вибраций при тапах)
+if (window.Telegram && window.Telegram.WebApp) {
+  window.Telegram.WebApp.HapticFeedback = window.Telegram.WebApp.HapticFeedback || {
+    impactOccurred: function(style) { return this; },  // light/medium/heavy/rigid/soft
+    notificationOccurred: function(type) { return this; },  // error/success/warning
+    selectionChanged: function() { return this; },
+  };
+
+  // JS-11: WebApp event registry
+  if (!window.Telegram.WebApp.__events) {
+    window.Telegram.WebApp.__events = {};
+    window.Telegram.WebApp.onEvent = function(name, cb) {
+      var e = window.Telegram.WebApp.__events;
+      (e[name] = e[name] || []).push(cb);
+    };
+    window.Telegram.WebApp.offEvent = function(name, cb) {
+      var arr = window.Telegram.WebApp.__events[name];
+      if (!arr) return;
+      var i = arr.indexOf(cb);
+      if (i >= 0) arr.splice(i, 1);
+    };
+    // Хелпер для триггера событий из Python
+    window.Telegram.WebApp.__triggerEvent = function(name, data) {
+      var arr = window.Telegram.WebApp.__events[name];
+      if (!arr) return;
+      arr.forEach(function(cb) { try { cb(data); } catch (e) {} });
+    };
+  }
+}
+
+// window.history.length > 0 (real users navigated to here)
+try {
+  if (window.history && window.history.length === 0) {
+    Object.defineProperty(window.history, "length", { get: function() { return 1 + (Date.now() % 3); } });
+  }
+} catch (e) {}
+
+// Web Share API stub
+navigator.share = navigator.share || function() { return Promise.resolve(); };
+navigator.canShare = navigator.canShare || function() { return true; };
+
+// Network Information API (real Android exposes effectiveType)
+if (!navigator.connection) {
+  navigator.connection = {
+    effectiveType: "4g",
+    type: "cellular",
+    downlink: 10,
+    rtt: 50,
+    saveData: false,
+    addEventListener: function() {},
+    removeEventListener: function() {},
+  };
+}
 
 })(_global);

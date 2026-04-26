@@ -28,12 +28,30 @@ _HTTP_RELOGIN_STATUS_CODES = frozenset({401, 419, 498})
 # Временные отказы / лимиты — повтор до raise_for_status.
 _RETRYABLE_HTTP_STATUS = frozenset({429, 502, 503, 504})
 _MAX_HTTP_TRANSIENT_RETRIES = 4
-# Conservative rate limiting: match official client request velocities.
-# Under production credentials, request pacing must be indistinguishable
-# from a real user tapping through the Mini App UI.
-_HTTP_REQUEST_MAX_PARALLEL = 2
-_HTTP_REQUEST_START_GAP_SEC = 0.8
-_HTTP_REQUEST_START_JITTER_SEC = 1.2
+_HTTP_REQUEST_MAX_PARALLEL = 8
+_HTTP_REQUEST_START_GAP_SEC = 0.15
+_HTTP_REQUEST_START_JITTER_SEC = 0.30
+
+# Harmless methods that can be added to any batch as "noise" to vary fingerprint.
+_BATCH_NOISE_METHODS = [
+    "app.telegram.get",
+    "user.getBalance",
+    "rewardedProgress.getAll",
+    "dailyCheckin.getInformation",
+]
+# Methods that must NOT have their batch shuffled or padded (order-sensitive).
+_BATCH_NO_RANDOMIZE_IDS = frozenset({
+    "user.authentication.loginUsingTelegram",
+})
+
+
+class GameeTransientServerError(RuntimeError):
+    """Транзиентная ошибка сервера Gamee (например -32603 Server error).
+
+    Не выводить traceback — это ожидаемая ошибка временной недоступности.
+    Worker должен пометить аккаунт временной ошибкой и повторить позже.
+    """
+    pass
 
 
 def _http_status_from_error(exc: BaseException) -> int | None:
@@ -631,6 +649,10 @@ class GameeClient:
     _request_semaphore = threading.Semaphore(_HTTP_REQUEST_MAX_PARALLEL)
     _request_gate_lock = threading.Lock()
     _next_request_not_before = 0.0
+    # ADAPT-1/2: cluster-wide rate-limit awareness (per-proxy multiplier)
+    # Когда один аккаунт ловит 429, все аккаунты с того же proxy замедляются.
+    _rate_limit_state: dict[str, tuple[float, float]] = {}  # proxy -> (last_429_ts, multiplier)
+    _rate_limit_lock = threading.Lock()
 
     def __init__(
         self,
@@ -639,21 +661,70 @@ class GameeClient:
         proxy_url: str | None = None,
         http_profile: GameeHttpClientProfile,
         transport: GameeTransport | None = None,
+        account_label: str = "",
+        cookie_base_dir: Any = None,
     ) -> None:
         self._cfg = cfg
         self._transport = transport or build_default_gamee_transport(
             backend_name=cfg.transport_backend,
             proxy_url=proxy_url,
             http_profile=http_profile,
+            account_label=account_label,
+            cookie_base_dir=cookie_base_dir,
         )
         self._proxy_url = self._transport.proxy_url
         # Один раз за жизнь клиента: GET prizes → cookie / контекст для Cloudflare перед API.
         self._browser_warmup_done = False
+        # Gamee validates JSON-RPC id format; keep request ids equal to method names.
+        # NET-5: assets cache на 30с (избегает predictable get_assets_state перед каждым play)
+        self._assets_cache: tuple[AccountGameState, float] | None = None
+        self._assets_cache_ttl_sec = 30.0
 
     @property
     def proxy_url(self) -> str | None:
         """Текущий нормализованный URL прокси (или None = без прокси)."""
         return self._proxy_url
+
+    @property
+    def telemetry_generator(self) -> Any:
+        """Input telemetry generator из transport (может быть None)."""
+        return getattr(self._transport, "telemetry_generator", None)
+
+    def simulate_play_tap(self, session: GameeSession) -> None:
+        """Генерировать tap-событие на кнопку Play и выдержать реалистичную паузу.
+
+        Не ломает основной поток при любой ошибке. Попутно пробует
+        отправить telemetry-payload на analytics-endpoint (non-fatal).
+        """
+        try:
+            gen = self.telemetry_generator
+            if gen is None:
+                return
+            prof = session.http_profile
+            cx = prof.screen_width * 0.5
+            cy = prof.screen_height * 0.7
+            events = gen.generate_tap(cx, cy, target="button.play-btn")
+            if events:
+                duration_ms = events[-1].timestamp - events[0].timestamp
+                time.sleep(max(0.0, duration_ms / 1000.0))
+            payloads = gen.assemble_telemetry_payload(events)
+            if not payloads:
+                return
+            analytics_url = self._cfg.api_url.rstrip("/").replace("api2", "analytics") + "/events"
+            for batch in payloads:
+                try:
+                    self._transport.send(GameeTransportRequest(
+                        method="POST",
+                        url=analytics_url,
+                        headers=self._headers(session),
+                        data=json.dumps(batch.to_payload(), ensure_ascii=False).encode(),
+                        timeout=(5.0, 10.0),
+                        purpose="telemetry",
+                    ))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._transport.close()
@@ -675,10 +746,36 @@ class GameeClient:
         base = min(1.25 * (2**attempt), 18.0)
         return base + random.uniform(0.25, min(1.75, max(0.25, base * 0.2)))
 
+    @classmethod
+    def _note_rate_limit(cls, proxy_key: str) -> None:
+        """Зафиксировать 429 от данного proxy → все аккаунты с этого IP замедлятся."""
+        with cls._rate_limit_lock:
+            cls._rate_limit_state[proxy_key] = (time.time(), 2.5)
+
+    @classmethod
+    def _rate_limit_multiplier(cls, proxy_key: str) -> float:
+        """Текущий slowdown multiplier (decays exponentially за 5 минут)."""
+        with cls._rate_limit_lock:
+            entry = cls._rate_limit_state.get(proxy_key)
+        if entry is None:
+            return 1.0
+        last_ts, mult = entry
+        elapsed = time.time() - last_ts
+        if elapsed > 300.0:
+            return 1.0
+        # Экспоненциальное decay: каждую минуту делим на 2
+        decay = 0.5 ** (elapsed / 60.0)
+        return 1.0 + (mult - 1.0) * decay
+
     def _call_with_http_gate(self, fn):
         self.__class__._request_semaphore.acquire()
         try:
             delay = self.__class__._reserve_request_delay()
+            # ADAPT-2: если по нашему proxy недавно был 429, добавляем slowdown
+            proxy_key = self._proxy_url or "_direct"
+            mult = self.__class__._rate_limit_multiplier(proxy_key)
+            if mult > 1.0:
+                delay *= mult
             if delay > 0:
                 time.sleep(delay)
             return fn()
@@ -686,11 +783,18 @@ class GameeClient:
             self.__class__._request_semaphore.release()
 
     def _ensure_prizes_page_warmup(self, session: GameeSession) -> None:
-        """GET главной prizes — те же TLS/cookie jar, что и у POST api2 (как заход из браузера)."""
+        """GET главной prizes — те же TLS/cookie jar, что и у POST api2 (как заход из браузера).
+
+        Bootstrap diversification (NET-2):
+        - случайная задержка 50-300мс перед GET (имитация загрузки/рендера)
+        - 30% шанс попутно подгрузить favicon.ico (как реальный браузер)
+        """
         if self._browser_warmup_done:
             return
         p = session.http_profile
         headers = p.ordered_navigation_headers()
+        # Random delay — имитация задержки JS bundle parse + render
+        time.sleep(random.uniform(0.05, 0.30))
         try:
             resp = self._call_with_http_gate(
                 lambda: self._transport.send(
@@ -709,6 +813,29 @@ class GameeClient:
         code = int(getattr(resp, "status_code", 0) or 0)
         if 200 <= code < 400:
             self._browser_warmup_done = True
+        # 30% шанс — favicon.ico (так делает любой браузер при первой загрузке)
+        if self._browser_warmup_done and random.random() < 0.30:
+            try:
+                fav_headers = p.ordered_navigation_headers()
+                fav_headers["accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+                fav_headers["sec-fetch-dest"] = "image"
+                fav_headers["sec-fetch-mode"] = "no-cors"
+                fav_headers["sec-fetch-site"] = "same-origin"
+                fav_headers["referer"] = "https://prizes.gamee.com/"
+                self._call_with_http_gate(
+                    lambda: self._transport.send(
+                        GameeTransportRequest(
+                            method="GET",
+                            url="https://prizes.gamee.com/favicon.ico",
+                            headers=fav_headers,
+                            timeout=(5.0, 10.0),
+                            allow_redirects=True,
+                            purpose="favicon",
+                        )
+                    )
+                )
+            except Exception:
+                pass
 
     def _headers(self, session: GameeSession) -> dict[str, str]:
         # Профиль согласован с TLS (session.http_profile ↔ self._http_profile при правильном использовании).
@@ -720,10 +847,32 @@ class GameeClient:
             auth_token=auth,
         )
 
+
+    @staticmethod
+    def _randomize_batch(body):
+        """Vary batch composition to avoid static fingerprinting."""
+        if not isinstance(body, list) or len(body) < 2:
+            return body
+        ids_in_batch = {item.get("id", "") for item in body}
+        if ids_in_batch & _BATCH_NO_RANDOMIZE_IDS:
+            return body
+        items = list(body)
+        if random.random() < 0.65:
+            random.shuffle(items)
+        if random.random() < 0.35:
+            noise_method = random.choice(_BATCH_NOISE_METHODS)
+            if noise_method not in ids_in_batch:
+                noise_item = {"jsonrpc": "2.0", "id": noise_method, "method": noise_method, "params": {}}
+                items.insert(random.randint(0, len(items)), noise_item)
+        return items
     def _post_batch_raw(self, session: GameeSession, body: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, Any]]:
         """Один POST без перелогина. Для loginUsingTelegram — только так, иначе рекурсия."""
         url = self._cfg.api_url.rstrip("/") + "/"
-        payload = json.dumps(body, ensure_ascii=False)
+        send_body = self._randomize_batch(body) if isinstance(body, list) else body
+        # Gamee validates JSON-RPC id format. Do not randomize ids here:
+        # loginUsingTelegram returns -32700 "Invalid [id] format" otherwise.
+        id_map: dict[Any, str] = {}
+        payload = json.dumps(send_body, ensure_ascii=False)
         r = None
         for attempt in range(_MAX_HTTP_TRANSIENT_RETRIES):
             try:
@@ -745,6 +894,10 @@ class GameeClient:
                     continue
                 raise
             code = int(r.status_code)
+            if code == 429:
+                # ADAPT-1: фиксируем rate-limit для proxy → все аккаунты с него замедлятся
+                proxy_key = self._proxy_url or "_direct"
+                self.__class__._note_rate_limit(proxy_key)
             if code in _RETRYABLE_HTTP_STATUS and attempt + 1 < _MAX_HTTP_TRANSIENT_RETRIES:
                 time.sleep(self._retry_delay_seconds(attempt))
                 continue
@@ -752,10 +905,20 @@ class GameeClient:
             break
         assert r is not None
         data = r.json()
+        # Восстанавливаем id → method для совместимости с _by_id.
+        def _restore_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if not id_map:
+                return rows
+            for row in rows:
+                if isinstance(row, dict) and "id" in row:
+                    mapped = id_map.get(row["id"])
+                    if mapped is not None:
+                        row["id"] = mapped
+            return rows
         if isinstance(data, list):
-            return data
+            return _restore_ids(data)
         if isinstance(data, dict):
-            return [data]
+            return _restore_ids([data])
         raise RuntimeError("Неожиданный ответ API")
 
     def _post_batch(self, session: GameeSession, body: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, Any]]:
@@ -811,7 +974,79 @@ class GameeClient:
             f"Получены ID: {got_ids}. Тело: {preview}"
         )
 
+    def _refresh_init_data_via_telethon(self, session: GameeSession) -> bool:
+        """Сбросить кеш initData. Worker подберёт fresh data в следующем цикле.
+
+        Раньше эта функция сразу делала Telethon WebView request (5-30с блокировка),
+        что приводило к зависанию интерфейса. Теперь только invalidate — быстро.
+        """
+        try:
+            self._invalidate_init_cache(session)
+        except Exception:
+            pass
+        return False  # worker через _session_for сделает fresh resolve
+
+    def _refresh_init_data_via_telethon_DISABLED(self, session: GameeSession) -> bool:
+        """[DISABLED] Прямой Telethon refresh — слишком медленно, блокирует поток."""
+        label = (session.account_label or "").strip()
+        if not label:
+            return False
+        try:
+            self._invalidate_init_cache(session)
+            from gamee_bot.telethon_bridge import resolve_init_data
+            from gamee_bot.account_store import load_accounts
+            from gamee_bot.config import load_config
+            yaml_path = session.accounts_yaml_path
+            if yaml_path is None:
+                return False
+            accounts = load_accounts(yaml_path)
+            acc = next((a for a in accounts if a.label.strip() == label), None)
+            if acc is None or not acc.telethon_session:
+                return False
+            cfg_path = yaml_path.parent / "config.yaml"
+            if not cfg_path.exists():
+                return False
+            cfg = load_config(cfg_path)
+            gr = None if acc.gamee_preexisting else acc.gamee_ref
+            fresh = resolve_init_data(
+                acc.label,
+                acc.init_data or "",
+                acc.telethon_session,
+                cfg,
+                account_gamee_ref=gr,
+            )
+            if fresh and fresh != session.init_data:
+                session.init_data = fresh
+                return True
+        except Exception:
+            pass
+        return False
+
     def login_telegram(self, session: GameeSession) -> None:
+        """Вход с быстрым retry на transient server errors (-32603).
+
+        Стратегия:
+        - 1 попытка сразу
+        - При -32603: refresh init_data + 2-5с пауза + 1 retry
+        - Если и retry упал — отдаём управление worker'у
+          (он сам сделает повторы через error_cooldown)
+        """
+        try:
+            self._login_telegram_once(session)
+            return
+        except GameeTransientServerError:
+            pass  # пробуем ещё раз с fresh init_data
+        # Один retry с обновлением init_data
+        try:
+            self._refresh_init_data_via_telethon(session)
+        except Exception:
+            pass
+        time.sleep(random.uniform(2.0, 5.0))
+        # На втором заходе — если опять -32603, поднимаем без traceback
+        self._login_telegram_once(session)
+
+    def _login_telegram_once(self, session: GameeSession) -> None:
+        """Одна попытка login. Поднимает GameeTransientServerError для -32603."""
         batch = [
             {"jsonrpc": "2.0", "id": "app.telegram.get", "method": "app.telegram.get", "params": {}},
             {
@@ -838,13 +1073,11 @@ class GameeClient:
             ) from e
         if not rows or not isinstance(rows, list):
             self._invalidate_init_cache(session)
-            raise RuntimeError(
-                f"loginUsingTelegram: пустой или неожиданный ответ от API: {str(rows)[:300]}"
+            raise GameeTransientServerError(
+                f"loginUsingTelegram: пустой ответ от API: {str(rows)[:200]}"
             )
 
-        # Handle batch-level server errors (id=None) — e.g. invalid initData,
-        # server overload, or rejected batch. These come as:
-        # {"jsonrpc": "2.0", "error": {...}, "id": null}
+        # Handle batch-level server errors (id=None) — invalid initData / overload.
         for row in rows:
             if row.get("id") is None and "error" in row:
                 err_obj = row["error"]
@@ -853,10 +1086,15 @@ class GameeClient:
                 detail = err_obj.get("data", {})
                 reason = detail.get("reason", "") if isinstance(detail, dict) else str(detail)
                 self._invalidate_init_cache(session)
+                # -32603 (Server error) — transient, retry в login_telegram
+                if code == -32603:
+                    raise GameeTransientServerError(
+                        f"Server error (code={code}, msg={msg}, reason={reason})"
+                    )
+                # Другие ошибки — не transient, не делаем retry
                 raise RuntimeError(
                     f"loginUsingTelegram: сервер отклонил запрос "
-                    f"(code={code}, message={msg}, reason={reason}). "
-                    f"initData будет обновлён при следующей попытке."
+                    f"(code={code}, message={msg}, reason={reason})."
                 )
 
         login_row = self._by_id(rows, "user.authentication.loginUsingTelegram")
@@ -1053,7 +1291,15 @@ class GameeClient:
 
     def play_board(self, session: GameeSession, *, _relogin: bool = False) -> PlayOutcome:
         self.ensure_session(session)
-        before = self.get_assets_state(session)
+        # NET-5: 60% попыток использовать кешированный state если ему < 30с
+        before: AccountGameState | None = None
+        if self._assets_cache is not None and random.random() < 0.60:
+            cached_state, cached_at = self._assets_cache
+            if time.monotonic() - cached_at < self._assets_cache_ttl_sec:
+                before = cached_state
+        if before is None:
+            before = self.get_assets_state(session)
+            self._assets_cache = (before, time.monotonic())
         if before.last_error:
             return PlayOutcome(ok=False, before=before, error=before.last_error)
 
@@ -1090,6 +1336,8 @@ class GameeClient:
             )
 
         after = self.get_assets_state(session)
+        # NET-5: обновляем кеш свежим состоянием
+        self._assets_cache = (after, time.monotonic())
         return PlayOutcome(
             ok=True,
             before=before,

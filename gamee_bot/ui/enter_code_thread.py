@@ -45,6 +45,8 @@ class EnterCodeThread(QThread):
                     self._cfg.gamee,
                     proxy_url=proxy,
                     http_profile=session.http_profile,
+                    account_label=acc.label,
+                    cookie_base_dir=self._cfg.accounts_path.parent,
                 )
                 ok, msg = client.submit_check_task_code(
                     session, task_id=self._task_id, code=self._code

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from time import monotonic
 
 from PySide6.QtCore import QThread, Signal
 
@@ -10,7 +9,7 @@ from gamee_bot.client import AccountGameState, GameeClient
 from gamee_bot.config import AppConfig, gamee_proxy_table_summary, local_time_in_quiet_hours
 from gamee_bot.preview_loader import _daily_checkin_preview_row, _season_pass_preview_cell
 from gamee_bot.proxy_url import normalize_and_validate_gamee_proxy
-from gamee_bot.worker import MIN_ENERGY_TO_PLAY, build_gamee_session_for_account
+from gamee_bot.worker import build_gamee_session_for_account, play_energy_threshold_for_label
 
 
 class AccountActionThread(QThread):
@@ -104,6 +103,8 @@ class AccountActionThread(QThread):
                 self._cfg.gamee,
                 proxy_url=proxy,
                 http_profile=session.http_profile,
+                account_label=acc.label,
+                cookie_base_dir=self._cfg.accounts_path.parent,
             )
             if self._action == "sync":
                 state = client.get_assets_state(session)
@@ -142,8 +143,8 @@ class AccountActionThread(QThread):
                 self._emit_row(client, session, acc, state, status_override="лимит ходов на сегодня")
                 return
 
-            deadline = monotonic() + comp.session_duration_minutes * 60.0
             state = client.get_assets_state(session)
+            min_energy_to_play = play_energy_threshold_for_label(acc.label)
             self._emit_row(client, session, acc, state, status_override="ручная серия ходов")
             if state.last_error:
                 self.log_line.emit(f"[{acc.label}] Sync перед ходами не удался: {state.last_error}")
@@ -153,8 +154,7 @@ class AccountActionThread(QThread):
             while (
                 not self.isInterruptionRequested()
                 and move_idx < self._move_limit
-                and monotonic() < deadline
-                and state.energy >= MIN_ENERGY_TO_PLAY
+                and state.energy >= min_energy_to_play
             ):
                 outcome = client.play_board(session)
                 if not outcome.ok or outcome.after is None:
@@ -190,13 +190,9 @@ class AccountActionThread(QThread):
                 self.log_line.emit(
                     f"[{acc.label}] Серия ходов завершена: достигнут лимит {self._move_limit} ходов."
                 )
-            elif monotonic() >= deadline:
+            elif state.energy < min_energy_to_play:
                 self.log_line.emit(
-                    f"[{acc.label}] Серия ходов завершена: достигнут лимит длительности сессии."
-                )
-            elif state.energy < MIN_ENERGY_TO_PLAY:
-                self.log_line.emit(
-                    f"[{acc.label}] Серия ходов завершена: энергии меньше {MIN_ENERGY_TO_PLAY}."
+                    f"[{acc.label}] Серия ходов завершена: энергии меньше {min_energy_to_play}."
                 )
             last_move_at = datetime.now().strftime("%Y.%m.%d %H:%M") if move_idx > 0 else ""
             final_state = client.get_assets_state(session)

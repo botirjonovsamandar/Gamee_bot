@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from gamee_bot.account_store import load_accounts, remove_account_by_label, set_account_proxy_url
 from gamee_bot.config import (
+    BACKGROUND_MODE_FULL_AUTO,
     BACKGROUND_MODE_MANUAL_ONLY,
     AppConfig,
     TELETHON_CREDENTIALS_REQUIRED_MSG,
@@ -82,7 +83,7 @@ class MainWindow(QMainWindow):
         self._worker_table_coalesce.setInterval(75)
         self._worker_table_coalesce.timeout.connect(self._flush_worker_table_pending)
         self._load_config_silent()
-        title = self._cfg.window_title if self._cfg else "Gamee — кубик доски"
+        title = self._cfg.window_title if self._cfg else "Manager"
         self.setWindowTitle(title)
         self.resize(1350, 750)
         self._build_ui()
@@ -141,8 +142,7 @@ class MainWindow(QMainWindow):
         manual_busy = self._manual_action_thread is not None and self._manual_action_thread.isRunning()
         code_busy = self._enter_code_thread is not None and self._enter_code_thread.isRunning()
         running = self._worker is not None and self._worker.isRunning()
-        mode = self._cfg.compliance.background_mode if self._cfg is not None else BACKGROUND_MODE_MANUAL_ONLY
-        self._btn_start_bot.setEnabled(not running and not manual_busy and not code_busy and mode != BACKGROUND_MODE_MANUAL_ONLY)
+        self._btn_start_bot.setEnabled(not running and not manual_busy and not code_busy)
         self._btn_stop_bot.setEnabled(running)
         self._btn_enter_code.setEnabled(not manual_busy and not code_busy)
         sel = self._selected_account_label() is not None
@@ -166,12 +166,8 @@ class MainWindow(QMainWindow):
             self._worker_status.setToolTip("Идёт фоновый цикл только в разрешённом режимом объёме.")
             self._worker_status.setObjectName("workerStatusRunning")
         else:
-            if self._cfg is not None and self._cfg.compliance.background_mode == BACKGROUND_MODE_MANUAL_ONLY:
-                self._worker_status.setText("○ Только ручной режим")
-                self._worker_status.setToolTip("Фон отключён настройкой compliance.background_mode=manual_only.")
-            else:
-                self._worker_status.setText(f"○ Фон остановлен · {mode}")
-                self._worker_status.setToolTip('Нажмите «Запустить фон» слева.')
+            self._worker_status.setText(f"○ Остановлено · {mode}")
+            self._worker_status.setToolTip('Нажмите «Запустить всё».')
             self._worker_status.setObjectName("workerStatusStopped")
         self._worker_status.style().unpolish(self._worker_status)
         self._worker_status.style().polish(self._worker_status)
@@ -190,9 +186,7 @@ class MainWindow(QMainWindow):
         else:
             backend_note = f"backend: {backend}"
         self._mode_notice.setText(
-            "Manual-first: TLS/HTTP профиль эмулирует Telegram Android WebView; Telethon использует профили реальных устройств. "
-            f"Фоновый режим: {background_mode_label(c.background_mode)}; quiet hours: {quiet}; "
-            f"лимит ручной сессии: {c.max_moves_per_session} ходов; дневной бюджет: {c.daily_move_budget}; {backend_note}."
+            f"Фоновый режим: {background_mode_label(c.background_mode)}; quiet hours: {quiet}; {backend_note}."
         )
 
     def _ensure_transport_backend_ready(self, title: str) -> bool:
@@ -450,10 +444,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._total_gold_summary)
 
         bar = QHBoxLayout()
-        self._btn_start_bot = QPushButton("Запустить фон")
-        self._btn_start_bot.setToolTip("Запускает разрешённый фоновый режим из настроек compliance.")
+        self._btn_start_bot = QPushButton("Запустить всё")
+        self._btn_start_bot.setToolTip("Запускает синхронизацию, клеймы и ходы для всех аккаунтов.")
         self._btn_start_bot.clicked.connect(self._start_worker)
-        self._btn_stop_bot = QPushButton("Остановить фон")
+        self._btn_stop_bot = QPushButton("Остановить всё")
         self._btn_stop_bot.setObjectName("btnStop")
         self._btn_stop_bot.setToolTip("Останавливает фоновый цикл полностью.")
         self._btn_stop_bot.setEnabled(False)
@@ -464,14 +458,17 @@ class MainWindow(QMainWindow):
         self._btn_sync_now.setToolTip("Ручная синхронизация выбранного аккаунта без фонового цикла.")
         self._btn_sync_now.clicked.connect(lambda: self._start_manual_action("sync"))
         bar.addWidget(self._btn_sync_now)
+        self._btn_sync_now.hide()
         self._btn_claim_daily = QPushButton("Claim daily")
         self._btn_claim_daily.setToolTip("Ручной клейм ежедневной награды для выбранного аккаунта.")
         self._btn_claim_daily.clicked.connect(lambda: self._start_manual_action("claim_daily"))
         bar.addWidget(self._btn_claim_daily)
+        self._btn_claim_daily.hide()
         self._btn_play_session = QPushButton("Play session")
         self._btn_play_session.setToolTip("Ручная ограниченная серия ходов для выбранного аккаунта.")
         self._btn_play_session.clicked.connect(lambda: self._start_manual_action("play_session"))
         bar.addWidget(self._btn_play_session)
+        self._btn_play_session.hide()
         self._btn_enter_code = QPushButton("Ввести код")
         self._btn_enter_code.setToolTip(
             "Промокод prizes.gamee.com для всех аккаунтов (telegram.checkTask.code)."
@@ -523,7 +520,7 @@ class MainWindow(QMainWindow):
         for c in range(9):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(8, QHeaderView.Stretch)
-        layout.addWidget(self._table)
+        layout.addWidget(self._table, 4)
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
@@ -531,8 +528,11 @@ class MainWindow(QMainWindow):
         if doc is not None:
             doc.setMaximumBlockCount(2000)
         self._log.setPlaceholderText("События будут здесь…")
-        self._log.setMaximumHeight(220)
-        layout.addWidget(self._log)
+        self._log.setMinimumHeight(180)
+        self._log.setMaximumHeight(260)
+        layout.addWidget(self._log, 2)
+
+        self._mode_notice.hide()
 
         self._regen_timer = QTimer(self)
         self._regen_timer.setInterval(1000)
@@ -636,15 +636,9 @@ class MainWindow(QMainWindow):
         if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
             QMessageBox.information(self, "Фон", "Дождитесь завершения текущего ручного действия.")
             return
-        if self._cfg.compliance.background_mode == BACKGROUND_MODE_MANUAL_ONLY:
-            QMessageBox.information(
-                self,
-                "Фон",
-                "В настройках выбран только ручной режим. Используйте кнопки Sync now / Claim daily / Play session.",
-            )
-            return
         if not self._ensure_transport_backend_ready("Фон"):
             return
+        self._cfg.compliance.background_mode = BACKGROUND_MODE_FULL_AUTO
         self._worker_table_pending = None
         self._worker = BotWorker(self._cfg, self)
         self._worker.table_updated.connect(
@@ -662,7 +656,7 @@ class MainWindow(QMainWindow):
         self._sync_bot_buttons()
         self._update_worker_status_label()
         self._log.append(
-            f"Фон запущен: {background_mode_label(self._cfg.compliance.background_mode)}."
+            "Запущено всё: синхронизация, награды и ходы для всех аккаунтов."
         )
 
     def _stop_worker(self) -> None:

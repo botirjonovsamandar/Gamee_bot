@@ -28,8 +28,8 @@ telethon:
   gamee_ref: null
   telegram_referral_ref: null
 compliance:
-  background_mode: manual_only  # manual_only | read_only
-  session_duration_minutes: 45
+  background_mode: manual_only  # manual_only | read_only | full_auto; кнопка "Запустить всё" форсирует full_auto на текущий запуск
+  session_duration_minutes: 0  # без лимита длительности; legacy key для старых config.yaml
   quiet_hours_enabled: false
   quiet_hours_start_hour: 0
   quiet_hours_end_hour: 8

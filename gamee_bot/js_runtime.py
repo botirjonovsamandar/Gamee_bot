@@ -51,6 +51,13 @@ class JSRuntimeConfig:
     language: str = "en-US"
     languages: tuple[str, ...] = ("en-US", "en")
     platform: str = "Linux armv8l"
+    # Battery state (рандомизируется per-session чтобы не было всегда charging+99%)
+    battery_charging: bool = False
+    battery_level: float = 0.78
+    # Timezone offset в минутах относительно UTC (положительный для запада, отрицательный для востока).
+    # Например для Москвы (UTC+3) timezone_offset_minutes = -180.
+    # JS Date.getTimezoneOffset() возвращает именно этот формат (Java-style).
+    timezone_offset_minutes: int = -180  # дефолт Moscow
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +181,34 @@ class TelegramWebViewJSRuntime:
 
   window.navigator = navigator;
   window.screen = screen;
+
+  // Per-account timezone (Date.getTimezoneOffset returns UTC offset in minutes,
+  // negative for east of UTC like Moscow=-180, positive for west).
+  (function(orig) {{
+    Date.prototype.getTimezoneOffset = function() {{ return {cfg.timezone_offset_minutes}; }};
+  }})(Date.prototype.getTimezoneOffset);
+
+  // Per-account WebGL renderer/vendor. UNMASKED_RENDERER_WEBGL=37446, UNMASKED_VENDOR_WEBGL=37445.
+  if (window.__SANDBOX_WEBGL_PARAMS__ === undefined) {{
+    window.__SANDBOX_WEBGL_PARAMS__ = {{
+      37446: {json.dumps(cfg.webgl_renderer)},
+      37445: {json.dumps(cfg.webgl_vendor)},
+      "RENDERER": {json.dumps(cfg.webgl_renderer)},
+      "VENDOR": {json.dumps(cfg.webgl_vendor)},
+    }};
+  }}
+
+  // Battery realism: разные значения per-session (без хардкода charging=true)
+  navigator.getBattery = function() {{
+    return Promise.resolve({{
+      charging: {str(cfg.battery_charging).lower()},
+      chargingTime: {str(cfg.battery_charging).lower()} ? Infinity : {0 if cfg.battery_charging else 7200 + (int(cfg.battery_level * 18000) % 3600)},
+      dischargingTime: {str(cfg.battery_charging).lower()} ? Infinity : {3600 + int((1 - cfg.battery_level) * 14400)},
+      level: {cfg.battery_level},
+      addEventListener: function() {{}},
+      removeEventListener: function() {{}}
+    }});
+  }};
 }})();
 """
         self._ctx.eval(overrides)

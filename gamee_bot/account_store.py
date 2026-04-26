@@ -32,6 +32,9 @@ class AccountRecord:
     # True = уже был зарегистрирован в Gamee до этого логина; рефы из YAML не применяются.
     gamee_preexisting: bool = False
     proxy_url: str | None = None  # только HTTP к API Gamee (api2.gamee.com); пусто — без прокси
+    # Дата первой инициализации аккаунта (ISO-8601). Используется для warmup phase —
+    # новые аккаунты играют меньше первые дни (имитация изучения интерфейса).
+    created_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"label": self.label, "install_uuid": self.install_uuid}
@@ -48,6 +51,8 @@ class AccountRecord:
         pu = normalize_gamee_proxy_url(self.proxy_url)
         if pu:
             d["proxy_url"] = pu
+        if self.created_at:
+            d["created_at"] = self.created_at
         return d
 
     @staticmethod
@@ -83,15 +88,16 @@ class AccountRecord:
         proxy_url = normalize_gamee_proxy_url(pr_raw) if pr_raw is not None else None
         iu = d.get("install_uuid")
         if iu is None or str(iu).strip() == "":
-            if init:
-                install = str(uuid.uuid5(uuid.NAMESPACE_URL, init))
-            else:
-                sp = Path(ts)
-                if not sp.is_absolute():
-                    sp = (accounts_yaml_dir / sp).resolve()
-                install = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{label}|{sp}"))
+            # UUID4 (random) — реальные устройства генерируют рандомный UUID при первом запуске.
+            # В отличие от UUID5(init_data), это НЕ детерминировано — нельзя восстановить корреляцию.
+            install = str(uuid.uuid4())
         else:
             install = str(iu).strip()
+        created_at = d.get("created_at")
+        if created_at is None:
+            # Если поле отсутствует — это новый аккаунт; ставим текущую дату ISO.
+            from datetime import datetime, timezone
+            created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return AccountRecord(
             label=label,
             init_data=init,
@@ -101,6 +107,7 @@ class AccountRecord:
             telegram_referral_ref=telegram_referral_ref,
             gamee_preexisting=gamee_preexisting,
             proxy_url=proxy_url,
+            created_at=str(created_at).strip() if created_at else None,
         )
 
 

@@ -131,7 +131,9 @@ class AccountsPreviewLoader(QThread):
             try:
                 prof = gamee_http_profile_for_label(acc.label)
                 client = GameeClient(
-                    self._cfg.gamee, proxy_url=pxy, http_profile=prof
+                    self._cfg.gamee, proxy_url=pxy, http_profile=prof,
+                    account_label=acc.label,
+                    cookie_base_dir=self._cfg.accounts_path.parent,
                 )
             except Exception as e:
                 err = str(e).strip() or "ошибка инициализации клиента"

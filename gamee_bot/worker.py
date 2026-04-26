@@ -1,18 +1,49 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import math
 import random
 import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from time import monotonic, sleep
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
 from gamee_bot.account_store import AccountRecord, load_accounts
-from gamee_bot.client import AccountGameState, GameeClient, GameeSession
+from gamee_bot.behavior_profile import (
+    BurstPlan,
+    MarkovSpeedState,
+    SessionMood,
+    SessionType,
+    activity_level_for_hour,
+    combined_delay_multiplier,
+    daily_budget_multiplier,
+    is_in_bad_week,
+    is_vacation_day,
+    pareto_move_delay,
+    plan_burst_schedule,
+    quiet_hours_offset_minutes,
+    roll_mood,
+    roll_session_type,
+    second_session_delay_hours,
+    should_abandon_session,
+    should_play_second_session,
+    should_skip_by_time_of_day,
+    startup_delay,
+    warmup_multiplier,
+)
+from gamee_bot.client import (
+    AccountGameState,
+    GameeClient,
+    GameeSession,
+    GameeTransientServerError,
+    PlayOutcome,
+)
 from gamee_bot.http_profile import gamee_http_profile_for_label
 from gamee_bot.config import (
     BACKGROUND_MODE_FULL_AUTO,
@@ -26,6 +57,7 @@ from gamee_bot.config import (
 from gamee_bot.proxy_url import normalize_and_validate_gamee_proxy
 from gamee_bot.notify import TelegramNotifier
 from gamee_bot.telegram_messages import (
+    format_board_move_message,
     format_daily_claim_message,
     format_season_claim_message,
     format_summary_message,
@@ -60,28 +92,59 @@ def build_gamee_session_for_account(cfg: AppConfig, acc: AccountRecord) -> Gamee
     )
 
 
-# Ходим, пока энергия ≥ этого порога; ожидание между циклами — по next_live с сервера + запас.
-MIN_ENERGY_TO_PLAY = 5
-POST_NEXT_LIVE_POLL_SLACK_SEC = 5
-BACKGROUND_READ_IDLE_SEC = 90.0
+# Порог энергии для НАЧАЛА игры (10, 15 или 20 — стабильно по label).
+# Играем до тех пор, пока энергия >= ENERGY_COST_PER_MOVE (тратим ВСЮ).
+ENERGY_COST_PER_MOVE = 5
+MIN_ENERGY_TO_PLAY_OPTIONS = (10, 15, 20)
+ENERGY_REGEN_MINUTES = 10  # 1 энергия = 10 минут
+POST_NEXT_LIVE_POLL_SLACK_SEC = 120
+_REGEN_WAIT_JITTER_SEC = 60.0
 # После сбоя не ждать «до регена» часами — быстрый повтор (смена прокси подхватывается в этом же цикле).
 _ERROR_RETRY_IDLE_SEC = 5.0
-SUPERVISOR_POLL_SEC = 2.0
-POST_DAILY_DONE_IDLE_SEC = 8.0
+
+
+def _supervisor_poll_delay() -> float:
+    """Jittered supervisor poll delay (3-15с) — не выглядит как regular polling."""
+    return random.uniform(3.0, 15.0)
+
+
+def _post_daily_idle() -> float:
+    return random.uniform(5.0, 15.0)
+
+
 # Пауза между стартом потоков аккаунтов (порядок как в accounts.yaml), чтобы не вшмыть API/UI разом.
 # Conservative stagger: official-grade pacing between account thread starts.
-ACCOUNT_THREAD_START_STAGGER_SEC = 2.0
-ACCOUNT_THREAD_START_STAGGER_JITTER_SEC = 3.0
+def _account_stagger_delay() -> float:
+    """Минимальный stagger между запусками потоков аккаунтов (0-0.4с).
+
+    Раньше было 2-30с (gamma) — пользователь жалуется что долго ждёт.
+    Теперь почти сразу: 0-0.4с просто чтобы не было точного бурста запросов.
+    """
+    return random.uniform(0.0, 0.4)
+
+
 # Одновременно не более N потоков аккаунтов в rewardedProgress (иначе прокси/API «задыхаются», все в SSL read).
 _SEASON_API_MAX_PARALLEL = 5
 _MAX_ERROR_BACKOFF_SEC = 90.0
 _SEASON_SYNC_MIN_INTERVAL_SEC = 45.0
 _IDLE_JITTER_SEC = 3.0
 
+
+def _regen_wait_slack() -> float:
+    """Задержка после расчётного регена перед проверкой энергии: 2-3 минуты."""
+    return POST_NEXT_LIVE_POLL_SLACK_SEC + random.uniform(0.0, _REGEN_WAIT_JITTER_SEC)
+
+
+# Когда энергия уже >= threshold — играем почти сразу (1-3с)
+_READY_TO_PLAY_JITTER_SEC = (1.0, 3.0)
+
 STATUS_IDLE = "ожидание"
 STATUS_SYNCING = "синхронизация…"
 STATUS_DAILY_IN_PROGRESS = "ежедневная награда…"
 STATUS_DAILY_DONE = "ежедневная награда выполнена"
+STATUS_MOVE_IN_PROGRESS = "бросок кубика…"
+STATUS_MOVE_DONE = "ход выполнен"
+STATUS_SLEEPING = "сон до регена"
 
 
 @dataclass
@@ -108,6 +171,27 @@ class RowState:
 def _local_time_last_move() -> str:
     """Время компьютера без указания часового пояса: ГГГГ.MM.DD ЧЧ:ММ"""
     return datetime.now().strftime("%Y.%m.%d %H:%M")
+
+
+def play_energy_threshold_for_label(label: str) -> int:
+    key = (label or "").strip().encode("utf-8")
+    digest = hashlib.sha256(key).digest()
+    return MIN_ENERGY_TO_PLAY_OPTIONS[digest[0] % len(MIN_ENERGY_TO_PLAY_OPTIONS)]
+
+
+def _human_move_delay() -> float:
+    """Бросок→анимация→результат→след.бросок: 3-8с с lognormal.
+
+    Реальная анимация кубика короче, юзеры быстро жмут "ещё бросок"
+    чтобы добить энергию. Lognormal вокруг 5с с natural variance.
+    """
+    base = random.lognormvariate(math.log(5.0), 0.25)
+    return max(3.0, min(8.0, base))
+
+
+def _human_pre_move_delay() -> float:
+    """Brief thinking pause before tapping 'Play' button (1-3s)."""
+    return random.uniform(1.0, 3.0)
 
 
 class BotWorker(QThread):
@@ -137,8 +221,74 @@ class BotWorker(QThread):
         self._telegram_notify_enabled = True
         self._error_streaks: dict[str, int] = {}
         self._error_cooldown_until: dict[str, float] = {}
+        self._last_error_delay: dict[str, float] = {}
         self._season_sync_due_at: dict[str, float] = {}
-        self._started_at_monotonic = 0.0
+        # daily_move_budget tracking: (UTC date str) -> {label -> count}
+        self._daily_moves: dict[str, dict[str, int]] = {}
+        self._daily_moves_lock = threading.Lock()
+        # Per-session mood (назначается при run()): good/neutral/bad
+        self._session_mood: SessionMood = SessionMood(name="neutral", delay_multiplier=1.0)
+        # Markov-like speed state per-account (BEH-3)
+        self._speed_state: dict[str, MarkovSpeedState] = {}
+        # Запланированные вторые сессии (BEH-8): label -> monotonic time когда играть снова
+        self._second_session_at: dict[str, float] = {}
+        # TG-1 poller (фоновые getMe/get_dialogs)
+        self._tg_poller: Any = None
+
+    def _personalized_move_delay(self, label: str) -> float:
+        """Move delay: Pareto (с outliers) × personality × mood × Markov speed state."""
+        base = pareto_move_delay()
+        # Markov state — темп игры держится с inertia 0.7
+        st = self._speed_state.get(label)
+        if st is None:
+            st = MarkovSpeedState(inertia=0.7)
+            self._speed_state[label] = st
+        st.step()
+        markov_mult = st.multiplier()
+        return base * combined_delay_multiplier(label, self._session_mood) * markov_mult
+
+    def _personalized_pre_move_delay(self, label: str) -> float:
+        """Pre-move delay с personality + mood multiplier."""
+        base = _human_pre_move_delay()
+        return base * combined_delay_multiplier(label, self._session_mood)
+
+    def _account_age_days(self, label: str) -> float:
+        """Возраст аккаунта в днях (по полю created_at в accounts.yaml)."""
+        acc = self._account_record_for_label(label)
+        if acc is None or not getattr(acc, "created_at", None):
+            return 999.0  # mature если нет поля
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            created = _dt.fromisoformat(str(acc.created_at).replace("Z", "+00:00"))
+            now = _dt.now(_tz.utc)
+            return max(0.0, (now - created).total_seconds() / 86400.0)
+        except Exception:
+            return 999.0
+
+    def _personal_daily_budget(self, label: str) -> int:
+        """Daily budget с per-account variance ±30% × warmup multiplier (BEH-7)."""
+        base = self._cfg.compliance.daily_move_budget
+        if base <= 0:
+            return 0
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        variance = daily_budget_multiplier(label, date_str)
+        warmup = warmup_multiplier(self._account_age_days(label))
+        return max(1, int(base * variance * warmup))
+
+    def _daily_moves_used(self, label: str) -> int:
+        key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._daily_moves_lock:
+            return self._daily_moves.get(key, {}).get(label, 0)
+
+    def _daily_moves_add(self, label: str, delta: int = 1) -> None:
+        key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._daily_moves_lock:
+            day = self._daily_moves.setdefault(key, {})
+            day[label] = day.get(label, 0) + delta
+            # Удаляем данные за вчера, чтобы не копить.
+            stale = [k for k in self._daily_moves if k != key]
+            for k in stale:
+                del self._daily_moves[k]
 
     def set_telegram_notify_enabled(self, enabled: bool) -> None:
         """Вкл/выкл отправку уведомлений бота в Telegram (ходы, ежедневка, сезон, сводка)."""
@@ -201,6 +351,7 @@ class BotWorker(QThread):
     def _note_account_success(self, label: str) -> None:
         self._error_streaks.pop(label, None)
         self._error_cooldown_until.pop(label, None)
+        self._last_error_delay.pop(label, None)
 
     def _background_mode(self) -> str:
         return self._cfg.compliance.background_mode
@@ -215,10 +366,17 @@ class BotWorker(QThread):
         if not self._background_mode_allows_sync():
             return "manual-first: фон отключён"
         c = self._cfg.compliance
+        # Per-account offset ±30 минут — аккаунты не "просыпаются" синхронно
+        offset_min = quiet_hours_offset_minutes(label)
+        from datetime import timedelta
+        shifted_now = datetime.now() + timedelta(minutes=offset_min)
+        # Vacation days и bad weeks отключены по требованию пользователя:
+        # все аккаунты должны играть всегда (когда есть энергия).
         if local_time_in_quiet_hours(
             c.quiet_hours_enabled,
             c.quiet_hours_start_hour,
             c.quiet_hours_end_hour,
+            now=shifted_now,
         ):
             return "quiet hours"
         until = self._error_cooldown_until.get(label, 0.0)
@@ -263,21 +421,44 @@ class BotWorker(QThread):
         return False
 
     def _idle_sleep_seconds_for_row(self, label: str, row: RowState) -> float:
-        """Пауза одного аккаунта до следующего опроса."""
+        """Пауза аккаунта до следующего цикла.
+
+        Логика: если энергия < порога — спим до тех пор, пока сервер
+        не накопит нужное количество. Используем nextLiveAddedTimestamp
+        (regen_deadline_utc) как базу, дальше считаем сколько ещё нужно.
+        Не дёргаем API во время сна.
+        """
         if self._row_needs_quick_retry_after_error(row):
             streak = max(1, self._error_streaks.get(label, 1))
-            base = min(_ERROR_RETRY_IDLE_SEC * (2 ** (streak - 1)), _MAX_ERROR_BACKOFF_SEC)
-            return float(base + random.uniform(0.0, min(4.0, max(1.0, base * 0.2))))
+            prev = self._last_error_delay.get(label, _ERROR_RETRY_IDLE_SEC)
+            base = random.uniform(_ERROR_RETRY_IDLE_SEC, prev * 3.0)
+            delay = min(base, _MAX_ERROR_BACKOFF_SEC) + random.uniform(0.0, 5.0)
+            self._last_error_delay[label] = delay
+            return delay
+
+        threshold = play_energy_threshold_for_label(label)
         now = datetime.now(timezone.utc)
-        if row.energy >= MIN_ENERGY_TO_PLAY:
-            return float(BACKGROUND_READ_IDLE_SEC + random.uniform(0.0, 12.0))
+
+        # Энергия уже >= порога — играть почти сразу (1-3с jitter).
+        if row.energy >= threshold:
+            return random.uniform(*_READY_TO_PLAY_JITTER_SEC)
+
+        # Нет nextLive от сервера — аварийный фолбек.
         if row.regen_deadline_utc is None:
-            return 60.0 + random.uniform(0.0, 5.0)
+            need = max(1, threshold - row.energy)
+            return float(need * ENERGY_REGEN_MINUTES * 60) + _regen_wait_slack()
+
+        # Есть nextLive — это время, когда добавится СЛЕДУЮЩАЯ 1 энергия.
         at = row.regen_deadline_utc
         if at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
-        sec = (at + timedelta(seconds=POST_NEXT_LIVE_POLL_SLACK_SEC) - now).total_seconds()
-        return max(float(POST_NEXT_LIVE_POLL_SLACK_SEC), sec) + random.uniform(0.0, _IDLE_JITTER_SEC)
+        # Сколько ещё энергий нужно сверх той одной, что придёт в nextLive.
+        energy_after_next = row.energy + 1
+        still_need = max(0, threshold - energy_after_next)
+        # Время до nextLive + оставшиеся регены + jitter.
+        sec_to_next = max(0.0, (at - now).total_seconds())
+        total_sleep = sec_to_next + still_need * ENERGY_REGEN_MINUTES * 60
+        return float(total_sleep) + _regen_wait_slack()
 
     def _join_finished_threads(self, alive_labels: set[str]) -> None:
         for dead in list(self._account_threads.keys()):
@@ -291,22 +472,36 @@ class BotWorker(QThread):
         self._account_threads.clear()
 
     def run(self) -> None:
+        # Clean runtime reset: счётчики/ошибки с нуля, но init_data cache сохраняем
+        # для быстрого повторного старта.
+        try:
+            GameeClient._next_request_not_before = 0.0
+            # Сброс cluster-wide rate-limit state — все proxy "чистые" при новом запуске
+            with GameeClient._rate_limit_lock:
+                GameeClient._rate_limit_state.clear()
+        except Exception:
+            pass
+        # Сброс daily moves, error streaks, speed states — всё с нуля
+        with self._daily_moves_lock:
+            self._daily_moves.clear()
+        self._error_streaks.clear()
+        self._error_cooldown_until.clear()
+        self._last_error_delay.clear()
+        self._speed_state.clear()
+        self._second_session_at.clear()
+        self._season_sync_due_at.clear()
+        # Per-session mood: настроение этого запуска (good/neutral/bad)
+        self._session_mood = roll_mood()
+        self.log_message.emit(f"Сессия запущена: настроение = {self._session_mood.name}.")
+        # TG poller отключён: создаёт fight за Telethon session lock с основным циклом.
+        # Background getMe/get_dialogs можно вернуть позже когда session-locking будет сделан правильно.
+        self._tg_poller = None
+
         notifier = TelegramNotifier(self._cfg.telegram.bot_token, self._cfg.telegram.chat_id)
         self._notifier = notifier
         last_summary = monotonic()
-        self._started_at_monotonic = monotonic()
         try:
             while self._running:
-                if (
-                    self._cfg.compliance.session_duration_minutes > 0
-                    and monotonic() - self._started_at_monotonic
-                    >= self._cfg.compliance.session_duration_minutes * 60.0
-                ):
-                    self.log_message.emit(
-                        "Фоновая сессия остановлена: достигнут лимит длительности из настроек."
-                    )
-                    self._running = False
-                    break
                 try:
                     accounts = load_accounts(self._cfg.accounts_path)
                 except Exception as e:
@@ -362,16 +557,13 @@ class BotWorker(QThread):
                     t = threading.Thread(
                         target=self._account_thread_main,
                         args=(acc.label,),
-                        name=f"gamee-{acc.label}",
+                        name=f"worker-{hashlib.md5(acc.label.encode()).hexdigest()[:8]}",
                         daemon=True,
                     )
                     self._account_threads[acc.label] = t
                     t.start()
                     if i + 1 < len(pending_start):
-                        self._sleep_interruptible(
-                            ACCOUNT_THREAD_START_STAGGER_SEC
-                            + random.uniform(0.0, ACCOUNT_THREAD_START_STAGGER_JITTER_SEC)
-                        )
+                        self._sleep_interruptible(_account_stagger_delay())
 
                 self._emit_table()
 
@@ -392,14 +584,21 @@ class BotWorker(QThread):
                             self._send_summary(notifier)
                         last_summary = now_m
 
-                self._sleep_interruptible(SUPERVISOR_POLL_SEC)
+                self._sleep_interruptible(_supervisor_poll_delay())
         finally:
             self._running = False
             self._stop_all_account_threads()
+            if self._tg_poller is not None:
+                try:
+                    self._tg_poller.stop()
+                except Exception:
+                    pass
+                self._tg_poller = None
             self._notifier = None
             notifier.close()
 
     def _account_thread_main(self, label: str) -> None:
+        # Стартуем сразу — пользователь не хочет ждать.
         gc.disable()
         try:
             self._account_thread_inner(label)
@@ -437,6 +636,8 @@ class BotWorker(QThread):
                             self._cfg.gamee,
                             proxy_url=want_proxy,
                             http_profile=gamee_http_profile_for_label(label),
+                            account_label=label,
+                            cookie_base_dir=self._cfg.accounts_path.parent,
                         )
                     except Exception as e:
                         msg = str(e).strip() or repr(e)
@@ -478,19 +679,19 @@ class BotWorker(QThread):
         fresh = build_gamee_session_for_account(self._cfg, acc)
         resolved = fresh.init_data
         ref_id = fresh.telegram_referral_ref
-        s = self._sessions.get(acc.label)
-        if s is None or s.init_data != resolved:
-            self._sessions[acc.label] = fresh
-            return fresh
-        s = self._sessions[acc.label]
-        if s.telegram_referral_ref != ref_id:
-            s.telegram_referral_ref = ref_id
-            s.referral_linked = False
-        s.install_uuid = acc.install_uuid
-        s.http_profile = fresh.http_profile
-        s.accounts_yaml_path = yaml_path
-        s.account_label = acc.label
-        return s
+        with self._state_lock:
+            s = self._sessions.get(acc.label)
+            if s is None or s.init_data != resolved:
+                self._sessions[acc.label] = fresh
+                return fresh
+            if s.telegram_referral_ref != ref_id:
+                s.telegram_referral_ref = ref_id
+                s.referral_linked = False
+            s.install_uuid = acc.install_uuid
+            s.http_profile = fresh.http_profile
+            s.accounts_yaml_path = yaml_path
+            s.account_label = acc.label
+            return s
 
     def _apply_daily_checkin(
         self,
@@ -563,7 +764,7 @@ class BotWorker(QThread):
                         row.status = STATUS_DAILY_DONE
                         self._rows[label] = row
                 self._emit_table()
-                self._sleep_interruptible(POST_DAILY_DONE_IDLE_SEC, label=label)
+                self._sleep_interruptible(_post_daily_idle(), label=label)
                 with self._state_lock:
                     row = self._rows.get(label)
                     if row is not None:
@@ -708,8 +909,8 @@ class BotWorker(QThread):
             self._emit_table()
             return
         try:
+            session = self._session_for(acc)
             with self._state_lock:
-                session = self._session_for(acc)
                 self._rows[label] = row
         except Exception as e:
             err = (str(e).strip() or repr(e))[:800]
@@ -730,7 +931,26 @@ class BotWorker(QThread):
             self._emit_table()
             return
         try:
-            state = client.get_assets_state(session)
+            try:
+                state = client.get_assets_state(session)
+            except GameeTransientServerError as te:
+                # Gamee вернул JSON-RPC -32603. Это не обязательно outage сервера:
+                # часто причина в профиле запроса, initData или прокси.
+                with self._state_lock:
+                    row = self._rows.get(label) or RowState(
+                        label=label, energy=0, gold=0, usd_cents=0
+                    )
+                    row.proxy_cell = px_cell
+                    row.proxy_tooltip = px_tip
+                    row.status = "сервер занят, повтор позже"
+                    row.last_error = "Server error -32603 (transient)"
+                    self._rows[label] = row
+                self._note_account_error(label)
+                self.log_message.emit(
+                    f"[{label}] Gamee вернул -32603 при логине ({str(te)[:140]}). Повторим позже."
+                )
+                self._emit_table()
+                return
             if state.last_error:
                 self._note_account_error(label)
             else:
@@ -755,22 +975,47 @@ class BotWorker(QThread):
                 self._rows[label] = row
 
             if not state.last_error:
-                self._apply_season_pass(
+                # Randomize order of pre-play checks (human-like behavior)
+                _do_season_first = random.random() < 0.5
+                if _do_season_first:
+                    self._apply_season_pass(
+                        client,
+                        session,
+                        label,
+                        claim=self._background_mode_allows_claims(),
+                        force=self._background_mode_allows_claims(),
+                        notifier=notifier if self._background_mode_allows_claims() else None,
+                    )
+                    self._emit_table()
+                    self._apply_daily_checkin(
+                        client,
+                        session,
+                        label,
+                        allow_claim=self._background_mode_allows_claims(),
+                    )
+                else:
+                    self._apply_daily_checkin(
+                        client,
+                        session,
+                        label,
+                        allow_claim=self._background_mode_allows_claims(),
+                    )
+                    self._apply_season_pass(
+                        client,
+                        session,
+                        label,
+                        claim=self._background_mode_allows_claims(),
+                        force=self._background_mode_allows_claims(),
+                        notifier=notifier if self._background_mode_allows_claims() else None,
+                    )
+                    self._emit_table()
+            else:
+                self._apply_daily_checkin(
                     client,
                     session,
                     label,
-                    claim=self._background_mode_allows_claims(),
-                    force=self._background_mode_allows_claims(),
-                    notifier=notifier if self._background_mode_allows_claims() else None,
+                    allow_claim=self._background_mode_allows_claims(),
                 )
-                self._emit_table()
-
-            self._apply_daily_checkin(
-                client,
-                session,
-                label,
-                allow_claim=self._background_mode_allows_claims(),
-            )
 
             if state.last_error:
                 self._emit_table()
@@ -794,7 +1039,167 @@ class BotWorker(QThread):
                 else:
                     self._note_account_error(label)
 
-            self._emit_table()
+            threshold = play_energy_threshold_for_label(label)
+            if state.energy < threshold:
+                self._emit_table()
+                return
+
+            # ── Энергию ВСЕГДА сливаем до конца (как реальные юзеры) ──
+            # Quick/Deep sessions отключены — сливаем до 0 (energy < ENERGY_COST_PER_MOVE).
+            # Abandoned sessions тоже отключены — пользователь требует всегда сливать.
+
+            # Начальная сессия: имитация просмотра страницы перед игрой
+            try:
+                gen = client.telemetry_generator
+                if gen is not None:
+                    gen.generate_session_interaction(
+                        page_height=3200, num_taps=1, num_scrolls=2
+                    )
+            except Exception:
+                pass
+
+            # ── Play board loop ──
+            # Дневной бюджет с per-account variance ±30%
+            daily_budget = self._personal_daily_budget(label)
+            # BEH-2: Burst plan — разбиваем ходы на серии с длинными паузами между ними
+            estimated_moves = max(1, state.energy // ENERGY_COST_PER_MOVE)
+            burst_plan = plan_burst_schedule(estimated_moves)
+            burst_idx = 0
+            moves_in_current_burst = 0
+            move_idx = 0
+            while self._running and state.energy >= ENERGY_COST_PER_MOVE:
+                if daily_budget > 0 and self._daily_moves_used(label) >= daily_budget:
+                    self.log_message.emit(
+                        f"[{label}] Дневной бюджет ходов ({daily_budget}) исчерпан."
+                    )
+                    break
+                # Check for proxy changes mid-loop
+                fresh = self._account_record_for_label(label)
+                if fresh is not None:
+                    try:
+                        want_p = normalize_and_validate_gamee_proxy(fresh.proxy_url)
+                    except ValueError as e:
+                        self.log_message.emit(
+                            f"[{label}] Прокси в accounts.yaml: {e} — прерываю серию ходов."
+                        )
+                        break
+                    if want_p != client.proxy_url:
+                        self.log_message.emit(
+                            f"[{label}] Прокси изменён — переподключение с новым каналом."
+                        )
+                        break
+
+                move_idx += 1
+                with self._state_lock:
+                    row = self._rows.get(label) or RowState(
+                        label=label, energy=0, gold=0, usd_cents=0
+                    )
+                    row.status = STATUS_MOVE_IN_PROGRESS
+                    self._rows[label] = row
+                self._emit_table()
+
+                # Human-like: brief thinking pause before tapping "Play"
+                self._sleep_interruptible(self._personalized_pre_move_delay(label), label=label)
+                if not self._running:
+                    break
+
+                # Имитация tap-события на кнопку Play (телеметрия + реалистичная задержка)
+                client.simulate_play_tap(session)
+                if not self._running:
+                    break
+
+                outcome = client.play_board(session)
+                if not outcome.ok:
+                    with self._state_lock:
+                        row = self._rows.get(label) or RowState(
+                            label=label, energy=0, gold=0, usd_cents=0
+                        )
+                        row.status = "ход не удался"
+                        row.last_error = outcome.error or "?"
+                        self._rows[label] = row
+                    self._note_account_error(label)
+                    self.log_message.emit(
+                        f"[{label}] Бросок кубика #{move_idx}: не удалось — {outcome.error}"
+                    )
+                    self._emit_table()
+                    break
+
+                before = outcome.before
+                after = outcome.after
+                assert after is not None
+                state = after
+                ts = _local_time_last_move()
+                with self._state_lock:
+                    row = self._rows.get(label) or RowState(
+                        label=label, energy=0, gold=0, usd_cents=0
+                    )
+                    row.energy = after.energy
+                    row.gold = after.gold
+                    row.usd_cents = after.usd_cents
+                    row.gold_estimated_usd = after.gold_estimated_usd
+                    row.last_error = after.last_error or ""
+                    row.regen_deadline_utc = after.next_live_at_utc
+                    row.last_move_at = ts
+                    row.status = STATUS_MOVE_DONE
+                    self._rows[label] = row
+
+                self._note_account_success(label)
+                self._daily_moves_add(label)
+                reward_line = (
+                    outcome.rewards_text
+                    if outcome.rewards_text.strip() not in ("", "—")
+                    else "ничего"
+                )
+                dice_s = str(outcome.dice_value) if outcome.dice_value is not None else "?"
+                self.log_message.emit(
+                    f"[{label}] Ход #{move_idx}: выпало {dice_s}, награда {reward_line}, "
+                    f"энергия {before.energy}->{after.energy}, золото {before.gold}->{after.gold}."
+                )
+                self.session_earnings_move.emit(
+                    label,
+                    after.gold - before.gold,
+                    after.tickets - before.tickets,
+                    outcome.xp_gained,
+                )
+                if not after.last_error:
+                    self._apply_season_pass(
+                        client,
+                        session,
+                        label,
+                        claim=self._background_mode_allows_claims(),
+                        notifier=notifier if self._background_mode_allows_claims() else None,
+                    )
+                self._emit_table()
+
+                if not self._running:
+                    break
+                # BEH-2: Если завершён текущий burst — длинная пауза перед следующим
+                moves_in_current_burst += 1
+                if (
+                    burst_idx < len(burst_plan.bursts)
+                    and moves_in_current_burst >= burst_plan.bursts[burst_idx]
+                    and burst_idx < len(burst_plan.pauses)
+                ):
+                    pause = burst_plan.pauses[burst_idx]
+                    self.log_message.emit(
+                        f"[{label}] Burst #{burst_idx+1} done — long pause {pause:.0f}s."
+                    )
+                    self._sleep_interruptible(pause, label=label)
+                    burst_idx += 1
+                    moves_in_current_burst = 0
+                else:
+                    # Human-like: watch dice animation + check rewards (Pareto × personality × mood × Markov)
+                    self._sleep_interruptible(self._personalized_move_delay(label), label=label)
+                with self._state_lock:
+                    row = self._rows.get(label) or RowState(
+                        label=label, energy=0, gold=0, usd_cents=0
+                    )
+                    row.status = STATUS_IDLE
+                    self._rows[label] = row
+                self._emit_table()
+                if state.energy < ENERGY_COST_PER_MOVE:
+                    break
+
             return
         except Exception as e:
             with self._state_lock:

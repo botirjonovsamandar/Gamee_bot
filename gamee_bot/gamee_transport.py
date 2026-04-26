@@ -182,8 +182,17 @@ class CurlCffiGameeTransport:
         proxy_url: str | None = None,
         http_profile: GameeHttpClientProfile,
         init_data: str = "",
+        account_label: str = "",
+        cookie_base_dir: Any = None,
     ) -> None:
         self.proxy_url = proxy_url
+        self._account_label = account_label
+        # Базовая директория для cookie storage (рядом с config.yaml)
+        from pathlib import Path as _P
+        self._cookie_base_dir: _P | None = (
+            _P(cookie_base_dir) if cookie_base_dir else None
+        )
+        self._req_count_since_save = 0
         if proxy_url:
             validate_proxy_url_for_httpx(proxy_url)
         proxies: dict[str, str] | None = None
@@ -202,6 +211,18 @@ class CurlCffiGameeTransport:
             impersonate=http_profile.impersonate,
             extra_fp=extra_fp,
         )
+
+        # Загрузить ранее сохранённые cookies (Cloudflare cf_clearance и т.д.)
+        if self._account_label and self._cookie_base_dir:
+            try:
+                from gamee_bot.cookie_storage import load_cookies
+                for c in load_cookies(self._account_label, self._cookie_base_dir):
+                    self._client.cookies.jar.set_cookie(c)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "Cookie load failed", exc_info=True
+                )
 
         # Apply HTTP/2 SETTINGS, WINDOW_UPDATE, and pseudo-header order
         try:
@@ -228,8 +249,49 @@ class CurlCffiGameeTransport:
                 TelegramWebAppConfig,
                 TelegramWebViewJSRuntime,
             )
+            # Sync navigator.language with Accept-Language headers
+            _accept_lang = http_profile.accept_language
+            _primary_lang = (
+                _accept_lang.split(",")[0].split(";")[0].strip()
+                if _accept_lang else "en-US"
+            )
+            _lang_list = tuple(
+                l.split(";")[0].strip()
+                for l in _accept_lang.split(",")
+                if l.split(";")[0].strip()
+            ) if _accept_lang else ("en-US", "en")
+
+            # Battery realism: 30% заряжается, 70% разряжается, level 0.15-0.95
+            import random as _rand
+            _battery_charging = _rand.random() < 0.3
+            _battery_level = round(_rand.uniform(0.15, 0.95), 2)
+            # Per-account timezone (JS Date.getTimezoneOffset()).
+            try:
+                from gamee_bot.timezone_profile import get_account_timezone
+                _, _tz_hours = get_account_timezone(account_label)
+                _tz_offset_min = -int(_tz_hours * 60)  # JS-format: negative for east
+            except Exception:
+                _tz_offset_min = -180
+            # Per-account WebGL profile.
+            try:
+                from gamee_bot.http_profile import webgl_profile_for_label
+                _webgl_renderer, _webgl_vendor = webgl_profile_for_label(account_label)
+            except Exception:
+                _webgl_renderer, _webgl_vendor = "Adreno (TM) 730", "Qualcomm"
             self._js_runtime = TelegramWebViewJSRuntime.create(
-                js_config=JSRuntimeConfig(user_agent=http_profile.user_agent),
+                js_config=JSRuntimeConfig(
+                    user_agent=http_profile.user_agent,
+                    screen_width=http_profile.screen_width,
+                    screen_height=http_profile.screen_height,
+                    device_pixel_ratio=http_profile.device_pixel_ratio,
+                    webgl_renderer=_webgl_renderer,
+                    webgl_vendor=_webgl_vendor,
+                    language=_primary_lang,
+                    languages=_lang_list,
+                    battery_charging=_battery_charging,
+                    battery_level=_battery_level,
+                    timezone_offset_minutes=_tz_offset_min,
+                ),
                 tg_config=TelegramWebAppConfig(
                     init_data=init_data,
                     platform="android",
@@ -248,9 +310,9 @@ class CurlCffiGameeTransport:
         try:
             from gamee_bot.input_telemetry import InputTelemetryGenerator
             self._telemetry_gen = InputTelemetryGenerator(
-                screen_width=393,
-                screen_height=852,
-                device_pixel_ratio=2.75,
+                screen_width=http_profile.screen_width,
+                screen_height=http_profile.screen_height,
+                device_pixel_ratio=http_profile.device_pixel_ratio,
             )
         except Exception:
             import logging
@@ -269,7 +331,28 @@ class CurlCffiGameeTransport:
         """Access the input telemetry generator (may be None if init failed)."""
         return self._telemetry_gen
 
+    def _persist_cookies_throttled(self) -> None:
+        """Сохранить cookies каждые 10 запросов или при close()."""
+        if not (self._account_label and self._cookie_base_dir):
+            return
+        self._req_count_since_save += 1
+        if self._req_count_since_save < 10:
+            return
+        self._req_count_since_save = 0
+        try:
+            from gamee_bot.cookie_storage import save_cookies
+            save_cookies(self._account_label, self._client.cookies.jar, self._cookie_base_dir)
+        except Exception:
+            pass
+
     def close(self) -> None:
+        # Финальный flush cookies перед закрытием
+        if self._account_label and self._cookie_base_dir:
+            try:
+                from gamee_bot.cookie_storage import save_cookies
+                save_cookies(self._account_label, self._client.cookies.jar, self._cookie_base_dir)
+            except Exception:
+                pass
         self._client.close()
         if self._js_runtime is not None:
             self._js_runtime.close()
@@ -287,6 +370,7 @@ class CurlCffiGameeTransport:
             )
         except OSError as e:
             raise GameeTransportError(str(e)) from e
+        self._persist_cookies_throttled()
         return GameeTransportResponse(
             status_code=int(getattr(raw, "status_code", 0) or 0),
             text_loader=lambda raw_response=raw: raw_response.text or "",
@@ -349,10 +433,18 @@ def build_default_gamee_transport(
     proxy_url: str | None = None,
     http_profile: GameeHttpClientProfile,
     init_data: str = "",
+    account_label: str = "",
+    cookie_base_dir: Any = None,
 ) -> GameeTransport:
     backend = normalize_gamee_transport_backend(backend_name)
     if backend == GAMEE_TRANSPORT_BACKEND_CURL_CFFI_RAW_HTTP:
-        return CurlCffiGameeTransport(proxy_url=proxy_url, http_profile=http_profile, init_data=init_data)
+        return CurlCffiGameeTransport(
+            proxy_url=proxy_url,
+            http_profile=http_profile,
+            init_data=init_data,
+            account_label=account_label,
+            cookie_base_dir=cookie_base_dir,
+        )
     if backend == GAMEE_TRANSPORT_BACKEND_TELEGRAM_WEBVIEW:
         raise NotImplementedError(
             "Выбран transport_backend='telegram_webview', но backend ещё не реализован. "

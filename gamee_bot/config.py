@@ -43,7 +43,7 @@ def ensure_config_file(path: Path) -> None:
         "telethon": {"api_id": TELEGRAM_ANDROID_API_ID, "api_hash": TELEGRAM_ANDROID_API_HASH},
         "compliance": {
             "background_mode": BACKGROUND_MODE_MANUAL_ONLY,
-            "session_duration_minutes": 45,
+            "session_duration_minutes": 0,
             "quiet_hours_enabled": False,
             "quiet_hours_start_hour": 0,
             "quiet_hours_end_hour": 8,
@@ -55,7 +55,7 @@ def ensure_config_file(path: Path) -> None:
             "require_confirm_play_session": True,
         },
         "paths": {"accounts": "accounts.yaml"},
-        "ui": {"window_title": "Gamee — кубик доски"},
+        "ui": {"window_title": "Manager"},
     }
     path.write_text(
         yaml.safe_dump(default, allow_unicode=True, sort_keys=False),
@@ -377,7 +377,7 @@ def load_config(path: Path) -> AppConfig:
         compliance=ComplianceConfig(
             background_mode=normalize_background_mode(c.get("background_mode")),
             session_duration_minutes=_int_yaml_default(
-                c.get("session_duration_minutes", 45), 45, minimum=0
+                c.get("session_duration_minutes", 0), 0, minimum=0
             ),
             quiet_hours_enabled=bool(c.get("quiet_hours_enabled", False)),
             quiet_hours_start_hour=_int_yaml_default(
@@ -400,7 +400,7 @@ def load_config(path: Path) -> AppConfig:
             require_confirm_play_session=bool(c.get("require_confirm_play_session", True)),
         ),
         accounts_path=accounts_path,
-        window_title=str(u.get("window_title", "Gamee — кубик доски")),
+        window_title=str(u.get("window_title", "Manager")),
     )
 
 

@@ -267,11 +267,6 @@ class SettingsDialog(QDialog):
         limits_form.setSpacing(12)
         limits_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        self._session_minutes = QSpinBox()
-        self._session_minutes.setRange(1, 720)
-        self._session_minutes.setSuffix(" мин")
-        self._session_minutes.setValue(max(1, int(comp.get("session_duration_minutes", 45))))
-
         self._daily_move_budget = QSpinBox()
         self._daily_move_budget.setRange(1, 1000)
         self._daily_move_budget.setValue(max(1, int(comp.get("daily_move_budget", 30))))
@@ -289,7 +284,6 @@ class SettingsDialog(QDialog):
         self._stop_after_error_streak.setRange(1, 20)
         self._stop_after_error_streak.setValue(max(1, int(comp.get("stop_after_error_streak", 3))))
 
-        limits_form.addRow("Фоновая сессия максимум:", self._session_minutes)
         limits_form.addRow("Дневной бюджет ходов:", self._daily_move_budget)
         limits_form.addRow("Ходов за ручную сессию:", self._max_moves_session)
         limits_form.addRow("Cooldown после серии ошибок:", self._error_cooldown)
@@ -542,7 +536,7 @@ class SettingsDialog(QDialog):
         }
         compliance = {
             "background_mode": str(self._bg_mode.currentData() or BACKGROUND_MODE_MANUAL_ONLY),
-            "session_duration_minutes": int(self._session_minutes.value()),
+            "session_duration_minutes": 0,
             "quiet_hours_enabled": self._quiet_enabled.isChecked(),
             "quiet_hours_start_hour": int(self._quiet_start.value()),
             "quiet_hours_end_hour": int(self._quiet_end.value()),

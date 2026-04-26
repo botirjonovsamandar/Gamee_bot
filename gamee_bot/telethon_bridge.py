@@ -26,17 +26,69 @@ _session_io_locks_guard = threading.Lock()
 # Пул реальных Android-устройств для эмуляции официального Telegram-клиента.
 # Выбирается детерминированно по session path (один аккаунт — одно устройство).
 _ANDROID_DEVICE_POOL: tuple[tuple[str, str], ...] = (
+    # ── Флагманы Samsung ─────────────────────────────
     ("Samsung SM-S908B", "SDK 34"),      # Galaxy S22 Ultra
     ("Samsung SM-S918B", "SDK 34"),      # Galaxy S23 Ultra
     ("Samsung SM-S928B", "SDK 34"),      # Galaxy S24 Ultra
+    ("Samsung SM-G991B", "SDK 33"),      # Galaxy S21 (Android 13)
+    ("Samsung SM-G998B", "SDK 33"),      # Galaxy S21 Ultra (Android 13)
+    ("Samsung SM-S901B", "SDK 34"),      # Galaxy S22
+    ("Samsung SM-S916B", "SDK 34"),      # Galaxy S23+
+    ("Samsung SM-F731B", "SDK 34"),      # Galaxy Z Flip5
+    ("Samsung SM-F946B", "SDK 34"),      # Galaxy Z Fold5
+    # ── Флагманы Xiaomi/POCO ─────────────────────────
     ("Xiaomi 2201123G", "SDK 34"),       # Xiaomi 12 Pro
     ("Xiaomi 23113RKC6G", "SDK 34"),     # Xiaomi 14 Pro
+    ("Xiaomi 2210132G", "SDK 33"),       # Xiaomi 13 (Android 13)
+    ("Xiaomi 23116PN5BG", "SDK 34"),     # Xiaomi 14
+    ("POCO F5", "SDK 34"),               # POCO F5
+    ("Xiaomi 22101316G", "SDK 34"),      # POCO X5 Pro
+    ("M2102J20SG", "SDK 33"),            # POCO X3 Pro
+    # ── Pixel ────────────────────────────────────────
     ("Google Pixel 8 Pro", "SDK 34"),    # Pixel 8 Pro
+    ("Google Pixel 8", "SDK 34"),        # Pixel 8
+    ("Google Pixel 7 Pro", "SDK 34"),    # Pixel 7 Pro
     ("Google Pixel 7", "SDK 34"),        # Pixel 7
+    ("Google Pixel 7a", "SDK 34"),       # Pixel 7a
+    ("Google Pixel 6a", "SDK 34"),       # Pixel 6a
+    ("Google Pixel 6", "SDK 33"),        # Pixel 6 (Android 13)
+    # ── OnePlus ──────────────────────────────────────
     ("OnePlus IN2025", "SDK 34"),        # OnePlus 9 Pro
     ("OnePlus CPH2449", "SDK 34"),       # OnePlus 11
+    ("OnePlus CPH2581", "SDK 34"),       # OnePlus 12
+    ("OnePlus IV2201", "SDK 33"),        # OnePlus 10 Pro (Android 13)
+    # ── Средний сегмент ──────────────────────────────
+    ("Samsung SM-A546B", "SDK 34"),      # Galaxy A54
+    ("Samsung SM-A346B", "SDK 33"),      # Galaxy A34
+    ("Samsung SM-A526B", "SDK 33"),      # Galaxy A52
+    ("Samsung SM-S711B", "SDK 34"),      # Galaxy S23 FE
+    ("Xiaomi 23078RKD5C", "SDK 34"),     # Redmi Note 13 Pro
+    ("Xiaomi 23021RAAEG", "SDK 33"),     # Redmi Note 12 (Android 13)
+    ("Xiaomi 22041216C", "SDK 33"),      # Redmi 10C
+    # ── realme/honor/vivo ───────────────────────────
+    ("realme RMX3686", "SDK 33"),        # realme 11 Pro
+    ("realme RMX3771", "SDK 34"),        # realme GT 5 Pro
+    ("HONOR ANY-LX1", "SDK 33"),         # Honor Magic 5
+    ("HONOR LGE-NX9", "SDK 34"),         # Honor 90
+    ("vivo V2218", "SDK 33"),            # vivo X90
+    ("vivo V2266", "SDK 34"),            # vivo X100
+    # ── Sony ────────────────────────────────────────
+    ("XQ-DC54", "SDK 34"),               # Sony Xperia 1 V
+    ("XQ-CT54", "SDK 33"),               # Sony Xperia 1 IV
 )
-_TELETHON_APP_VERSION = "10.14.5"
+_TELETHON_APP_VERSIONS: tuple[str, ...] = (
+    # Распределение weighted: новые версии чаще встречаются у real users
+    "11.6.2", "11.6.2", "11.6.2",  # latest x3
+    "11.5.4", "11.5.4",             # prev x2
+    "11.4.2",
+    "11.3.4",
+    "11.2.3",
+    "11.1.2",
+    "11.0.0",
+    "10.14.5",                      # старые редкие
+    "10.13.4",
+    "10.12.0",
+)
 _TELETHON_SYSTEM_VERSION = "Android 14"
 
 # Официальная мини-аппа Gamee в Telegram (как в t.me/gamee/start?startapp=…)
@@ -126,8 +178,10 @@ def _client_for_session(path: str, api_id: int, api_hash: str) -> TelegramClient
     Без receive_updates — только RPC для входа / WebView.
     """
     import hashlib as _hl
-    idx = int.from_bytes(_hl.md5(path.encode()).digest()[:4], "big") % len(_ANDROID_DEVICE_POOL)
+    digest = _hl.md5(path.encode()).digest()
+    idx = int.from_bytes(digest[:4], "big") % len(_ANDROID_DEVICE_POOL)
     device_model, _sdk_tag = _ANDROID_DEVICE_POOL[idx]
+    app_ver = _TELETHON_APP_VERSIONS[int.from_bytes(digest[4:8], "big") % len(_TELETHON_APP_VERSIONS)]
 
     return TelegramClient(
         path,
@@ -135,7 +189,7 @@ def _client_for_session(path: str, api_id: int, api_hash: str) -> TelegramClient
         api_hash,
         device_model=device_model,
         system_version=_TELETHON_SYSTEM_VERSION,
-        app_version=_TELETHON_APP_VERSION,
+        app_version=app_ver,
         lang_code="en",
         system_lang_code="en-US",
         receive_updates=False,
