@@ -1,5 +1,29 @@
 # Gamee Gold Fest Bot
 
+## Web UI (React)
+
+Local web panel:
+
+```powershell
+python web_main.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+Development mode:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Backend stays on `http://127.0.0.1:8000`; Vite proxies `/api` and `/ws` to it.
+
 Desktop-клиент для Telegram Mini App `Gamee`: синхронизация аккаунтов, ходы по доске, ежедневные награды, сезонные награды, промокоды и лог событий в одном окне.
 
 Проект рассчитан на Windows и работает как многопоточное PySide6-приложение, которое управляет несколькими Telegram-аккаунтами одновременно.

@@ -38,8 +38,8 @@ compliance:
   fast_bootstrap_enabled: true
   bootstrap_account_stagger_min_seconds: 0.1
   bootstrap_account_stagger_max_seconds: 0.4
-  bootstrap_move_delay_min_seconds: 0.15
-  bootstrap_move_delay_max_seconds: 0.45
+  bootstrap_move_delay_min_seconds: 6.0
+  bootstrap_move_delay_max_seconds: 7.5
   steady_energy_targets: [10, 15, 20]
   error_cooldown_seconds: 30
   stop_after_error_streak: 3

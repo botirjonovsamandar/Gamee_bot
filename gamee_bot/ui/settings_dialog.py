@@ -324,10 +324,10 @@ class SettingsDialog(QDialog):
             float(comp.get("bootstrap_account_stagger_max_seconds", 0.4))
         )
         self._bootstrap_move_delay_min = _seconds_spin(
-            float(comp.get("bootstrap_move_delay_min_seconds", 0.15))
+            float(comp.get("bootstrap_move_delay_min_seconds", 6.0))
         )
         self._bootstrap_move_delay_max = _seconds_spin(
-            float(comp.get("bootstrap_move_delay_max_seconds", 0.45))
+            float(comp.get("bootstrap_move_delay_max_seconds", 7.5))
         )
         targets = comp.get("steady_energy_targets", [10, 15, 20])
         if isinstance(targets, (list, tuple)):

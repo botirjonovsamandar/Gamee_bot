@@ -1,0 +1,76 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  background: #f7f8fb;
+}
+
+button,
+input {
+  letter-spacing: 0;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+@layer components {
+  .top-btn {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-semibold transition;
+  }
+
+  .metric {
+    @apply rounded-lg bg-white p-3 ring-1 ring-slate-200;
+  }
+
+  .metric-label {
+    @apply text-xs font-semibold uppercase text-slate-500;
+  }
+
+  .metric-value {
+    @apply mt-1 text-2xl font-bold text-slate-950;
+  }
+
+  .metric-sub {
+    @apply mt-1 truncate text-xs text-slate-500;
+  }
+
+  .action-btn {
+    @apply inline-flex w-full items-center justify-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .log-line {
+    @apply rounded-md p-2 ring-1;
+  }
+
+  .log-info {
+    @apply bg-slate-50 text-slate-700 ring-slate-200;
+  }
+
+  .log-move {
+    @apply bg-emerald-50 text-emerald-800 ring-emerald-200;
+  }
+
+  .log-daily,
+  .log-season {
+    @apply bg-cyan-50 text-cyan-800 ring-cyan-200;
+  }
+
+  .log-error,
+  .log-fatal {
+    @apply bg-rose-50 text-rose-800 ring-rose-200;
+  }
+}
+

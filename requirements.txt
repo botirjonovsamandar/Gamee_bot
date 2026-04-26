@@ -1,4 +1,7 @@
 PySide6
+fastapi
+uvicorn[standard]
+pydantic
 httpx[socks]
 curl_cffi>=0.15.0
 PyYAML

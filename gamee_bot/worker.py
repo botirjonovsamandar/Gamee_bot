@@ -150,9 +150,15 @@ STATUS_DAILY_IN_PROGRESS = "ежедневная награда…"
 STATUS_DAILY_DONE = "ежедневная награда выполнена"
 STATUS_MOVE_IN_PROGRESS = "бросок кубика…"
 STATUS_MOVE_DONE = "ход выполнен"
+STATUS_WATCHING_ANIMATION = "смотрит анимацию…"
 STATUS_SLEEPING = "сон до регена"
 STATUS_BOOTSTRAP = "быстрый первый проход"
 STATUS_REGEN_WAIT = "ожидание регена"
+
+_DICE_ANIMATION_MIN_SEC = 6.0
+_DICE_ANIMATION_MAX_SEC = 7.5
+_REWARD_ANIMATION_EXTRA_MIN_SEC = 3.0
+_REWARD_ANIMATION_EXTRA_MAX_SEC = 4.5
 
 
 def _format_wait_duration(seconds: float) -> str:
@@ -327,6 +333,23 @@ class BotWorker(QThread):
             c.bootstrap_move_delay_max_seconds,
         )
         return random.uniform(lo, hi)
+
+    def _post_move_animation_delay(
+        self, label: str, *, bootstrap: bool, has_reward_animation: bool
+    ) -> float:
+        if bootstrap:
+            base = self._bootstrap_move_delay()
+        else:
+            base = max(
+                self._personalized_move_delay(label),
+                random.uniform(_DICE_ANIMATION_MIN_SEC, _DICE_ANIMATION_MAX_SEC),
+            )
+        if has_reward_animation:
+            base += random.uniform(
+                _REWARD_ANIMATION_EXTRA_MIN_SEC,
+                _REWARD_ANIMATION_EXTRA_MAX_SEC,
+            )
+        return base
 
     def _steady_targets(self) -> tuple[int, ...]:
         targets = tuple(
@@ -1422,6 +1445,7 @@ class BotWorker(QThread):
                     if outcome.rewards_text.strip() not in ("", "—")
                     else "ничего"
                 )
+                has_reward_animation = reward_line != "ничего"
                 dice_s = str(outcome.dice_value) if outcome.dice_value is not None else "?"
                 self.log_message.emit(
                     f"[{label}] Ход #{move_idx}: выпало {dice_s}, награда {reward_line}, "
@@ -1445,11 +1469,30 @@ class BotWorker(QThread):
 
                 if not self._running:
                     break
+                post_move_delay = self._post_move_animation_delay(
+                    label,
+                    bootstrap=bootstrap,
+                    has_reward_animation=has_reward_animation,
+                )
+                with self._state_lock:
+                    row = self._rows.get(label) or RowState(
+                        label=label, energy=0, gold=0, usd_cents=0
+                    )
+                    row.status = (
+                        f"{STATUS_BOOTSTRAP}: {STATUS_WATCHING_ANIMATION}"
+                        if bootstrap
+                        else STATUS_WATCHING_ANIMATION
+                    )
+                    self._rows[label] = row
+                self._emit_table()
                 if bootstrap:
-                    self._sleep_interruptible(self._bootstrap_move_delay(), label=label)
+                    self._sleep_interruptible(post_move_delay, label=label)
                 else:
                     # BEH-2: Если завершён текущий burst — длинная пауза перед следующим
                     moves_in_current_burst += 1
+                    self._sleep_interruptible(post_move_delay, label=label)
+                    if not self._running:
+                        break
                     if (
                         burst_idx < len(burst_plan.bursts)
                         and moves_in_current_burst >= burst_plan.bursts[burst_idx]
@@ -1462,12 +1505,6 @@ class BotWorker(QThread):
                         self._sleep_interruptible(pause, label=label)
                         burst_idx += 1
                         moves_in_current_burst = 0
-                    else:
-                        # Human-like: watch dice animation + check rewards (Pareto × personality × mood × Markov)
-                        self._sleep_interruptible(
-                            self._personalized_move_delay(label),
-                            label=label,
-                        )
                 with self._state_lock:
                     row = self._rows.get(label) or RowState(
                         label=label, energy=0, gold=0, usd_cents=0

@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
 
 # секреты и локальные данные
 accounts.yaml
