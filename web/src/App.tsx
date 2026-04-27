@@ -4,11 +4,13 @@ import {
   Dice5,
   Gift,
   Loader2,
+  Moon,
   Play,
   PlugZap,
   RefreshCw,
   Search,
   Square,
+  Sun,
   Trash2,
   Wifi,
   WifiOff
@@ -36,6 +38,9 @@ const emptyWorker: WorkerStatus = {
   manual_busy: false,
   code_busy: false
 };
+
+type ThemeMode = "light" | "dark";
+const THEME_STORAGE_KEY = "gamee-web-theme";
 
 const kindLabels: Record<LogKind | "all", string> = {
   all: "Все",
@@ -271,11 +276,20 @@ export default function App() {
   const [massCode, setMassCode] = useState("");
   const [taskId, setTaskId] = useState("");
   const [now, setNow] = useState(Date.now());
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return saved === "light" || saved === "dark" ? saved : "dark";
+  });
 
   const showToast = useCallback((text: string, error = false) => {
     setToast({ text, error });
     window.setTimeout(() => setToast(null), 4500);
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   const applySnapshot = useCallback((snap: Snapshot) => {
     setWorker(snap.worker);
@@ -398,6 +412,14 @@ export default function App() {
             </div>
             <div className="flex flex-wrap gap-2">
               <button
+                className="top-btn border border-slate-300 bg-white text-slate-800 hover:bg-slate-50"
+                onClick={() => setTheme((cur) => (cur === "dark" ? "light" : "dark"))}
+                title={theme === "dark" ? "Переключить на белый фон" : "Переключить на чёрный фон"}
+              >
+                {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+                {theme === "dark" ? "Белый фон" : "Чёрный фон"}
+              </button>
+              <button
                 className="top-btn bg-emerald-700 text-white hover:bg-emerald-800"
                 disabled={worker.running || worker.manual_busy || worker.code_busy}
                 onClick={() => runTopAction(startWorker)}
@@ -441,7 +463,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-[1800px] gap-4 px-4 py-4 lg:grid-cols-[minmax(0,1fr)_420px] lg:px-6">
+      <main className="mx-auto grid max-w-[1800px] items-start gap-4 px-4 py-4 lg:grid-cols-[minmax(0,1fr)_420px] lg:px-6">
         <section className="min-w-0 overflow-hidden rounded-lg bg-white shadow-soft ring-1 ring-slate-200">
           <div className="flex flex-col gap-3 border-b border-slate-200 p-3 md:flex-row md:items-center md:justify-between">
             <div className="relative max-w-md flex-1">
@@ -485,7 +507,7 @@ export default function App() {
           </div>
         </section>
 
-        <aside className="flex min-h-[520px] flex-col rounded-lg bg-white shadow-soft ring-1 ring-slate-200">
+        <aside className="flex h-[640px] max-h-[calc(100vh-2rem)] min-h-[420px] flex-col overflow-hidden rounded-lg bg-white shadow-soft ring-1 ring-slate-200 lg:sticky lg:top-4">
           <div className="border-b border-slate-200 p-3">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="font-bold text-slate-950">Логи</h2>
@@ -516,7 +538,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3">
             <div className="space-y-2">
               {filteredLogs.slice(-500).reverse().map((log, idx) => (
                 <div key={`${log.ts}-${idx}`} className={`log-line log-${log.kind}`}>
@@ -582,4 +604,3 @@ export default function App() {
     </div>
   );
 }
-

@@ -14,6 +14,7 @@ body {
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
   background: #f7f8fb;
+  color: #17202b;
 }
 
 button,
@@ -74,3 +75,125 @@ button:disabled {
   }
 }
 
+html[data-theme="dark"] body {
+  background: #05070b;
+  color: #e8eef7;
+}
+
+html[data-theme="dark"] .bg-panel,
+html[data-theme="dark"] .bg-white {
+  background-color: #0b111a !important;
+}
+
+html[data-theme="dark"] .bg-slate-50,
+html[data-theme="dark"] .bg-slate-100 {
+  background-color: #111927 !important;
+}
+
+html[data-theme="dark"] .hover\:bg-slate-50:hover {
+  background-color: #162131 !important;
+}
+
+html[data-theme="dark"] .bg-cyan-50\/80 {
+  background-color: rgba(8, 69, 86, 0.55) !important;
+}
+
+html[data-theme="dark"] .bg-slate-950\/25 {
+  background-color: rgba(0, 0, 0, 0.66) !important;
+}
+
+html[data-theme="dark"] .border-line,
+html[data-theme="dark"] .border-slate-200,
+html[data-theme="dark"] .border-slate-200\/80,
+html[data-theme="dark"] .border-slate-300 {
+  border-color: #243244 !important;
+}
+
+html[data-theme="dark"] .ring-slate-200,
+html[data-theme="dark"] .ring-slate-300 {
+  --tw-ring-color: #243244 !important;
+}
+
+html[data-theme="dark"] .text-slate-950,
+html[data-theme="dark"] .text-slate-900,
+html[data-theme="dark"] .text-slate-800,
+html[data-theme="dark"] .text-slate-700 {
+  color: #edf4ff !important;
+}
+
+html[data-theme="dark"] .text-slate-600,
+html[data-theme="dark"] .text-slate-500,
+html[data-theme="dark"] .text-slate-400 {
+  color: #9fb0c6 !important;
+}
+
+html[data-theme="dark"] input {
+  background-color: #0f1724;
+  color: #edf4ff;
+  border-color: #2a394d;
+}
+
+html[data-theme="dark"] input::placeholder {
+  color: #74859c;
+}
+
+html[data-theme="dark"] .metric,
+html[data-theme="dark"] .action-btn,
+html[data-theme="dark"] .log-line {
+  background-color: #0f1724;
+}
+
+html[data-theme="dark"] .bg-emerald-50 {
+  background-color: rgba(6, 78, 59, 0.35) !important;
+}
+
+html[data-theme="dark"] .text-emerald-700,
+html[data-theme="dark"] .text-emerald-800 {
+  color: #70e3ad !important;
+}
+
+html[data-theme="dark"] .ring-emerald-200 {
+  --tw-ring-color: rgba(52, 211, 153, 0.35) !important;
+}
+
+html[data-theme="dark"] .bg-cyan-50,
+html[data-theme="dark"] .bg-sky-50 {
+  background-color: rgba(8, 72, 92, 0.38) !important;
+}
+
+html[data-theme="dark"] .text-cyan-700,
+html[data-theme="dark"] .text-cyan-800,
+html[data-theme="dark"] .text-sky-700 {
+  color: #7ddff6 !important;
+}
+
+html[data-theme="dark"] .ring-cyan-200,
+html[data-theme="dark"] .ring-sky-200 {
+  --tw-ring-color: rgba(34, 211, 238, 0.34) !important;
+}
+
+html[data-theme="dark"] .bg-amber-50 {
+  background-color: rgba(120, 72, 8, 0.34) !important;
+}
+
+html[data-theme="dark"] .text-amber-700 {
+  color: #f8d276 !important;
+}
+
+html[data-theme="dark"] .ring-amber-200 {
+  --tw-ring-color: rgba(251, 191, 36, 0.34) !important;
+}
+
+html[data-theme="dark"] .bg-rose-50 {
+  background-color: rgba(127, 29, 29, 0.35) !important;
+}
+
+html[data-theme="dark"] .text-rose-600,
+html[data-theme="dark"] .text-rose-700,
+html[data-theme="dark"] .text-rose-800 {
+  color: #fda4af !important;
+}
+
+html[data-theme="dark"] .ring-rose-200 {
+  --tw-ring-color: rgba(251, 113, 133, 0.35) !important;
+}

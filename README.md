@@ -2,13 +2,25 @@
 
 ## Web UI (React)
 
-Local web panel:
+Локальная web-панель работает поверх того же Python-бота: backend остаётся в Python, а браузер получает таблицу, статусы и логи через WebSocket.
+
+Первый запуск / сборка web UI:
 
 ```powershell
+cd web
+npm install
+npm run build
+cd ..
 python web_main.py
 ```
 
-Open:
+Если PowerShell блокирует `npm.ps1`, используй:
+
+```powershell
+npm.cmd run build
+```
+
+Открыть:
 
 ```text
 http://127.0.0.1:8000
@@ -16,17 +28,38 @@ http://127.0.0.1:8000
 
 Development mode:
 
+Terminal 1:
+
+```powershell
+python web_main.py
+```
+
+Terminal 2:
+
 ```powershell
 cd web
-npm install
 npm run dev
 ```
 
-Backend stays on `http://127.0.0.1:8000`; Vite proxies `/api` and `/ws` to it.
+В dev-режиме Vite открывается отдельно:
+
+```text
+http://127.0.0.1:5173
+```
+
+Backend остаётся на `http://127.0.0.1:8000`; Vite проксирует `/api` и `/ws` к нему.
+
+В web UI есть:
+
+- realtime таблица аккаунтов;
+- realtime логи в отдельном прокручиваемом окне;
+- фильтры логов;
+- переключатель белого/чёрного фона с сохранением выбора в браузере;
+- start/stop фона, ручные действия по аккаунту, прокси, удаление аккаунта и массовый промокод.
 
 Desktop-клиент для Telegram Mini App `Gamee`: синхронизация аккаунтов, ходы по доске, ежедневные награды, сезонные награды, промокоды и лог событий в одном окне.
 
-Проект рассчитан на Windows и работает как многопоточное PySide6-приложение, которое управляет несколькими Telegram-аккаунтами одновременно.
+Проект рассчитан на Windows и сейчас имеет два интерфейса: desktop UI на PySide6 и локальный web UI на React/FastAPI. Оба используют одну и ту же бизнес-логику Gamee/Telegram.
 
 ## Что Делает Софт
 
@@ -38,7 +71,8 @@ Desktop-клиент для Telegram Mini App `Gamee`: синхронизаци�
 - автоматически забирает сезонные награды;
 - выполняет ходы по доске, пока хватает энергии и не достигнуты лимиты;
 - умеет массово отправлять промокод `telegram.checkTask.code` на все аккаунты;
-- показывает статус, энергию, золото, сезонку и живой лог внизу окна.
+- показывает статус, энергию, золото, сезонку и живой лог в desktop/web UI;
+- в web UI обновляет данные в реальном времени через WebSocket.
 
 ## Что Под Капотом
 
@@ -46,7 +80,9 @@ Desktop-клиент для Telegram Mini App `Gamee`: синхронизаци�
 
 | Слой | Технология | Назначение |
 |---|---|---|
-| GUI | PySide6 / Qt 6 | Главное окно, таблица аккаунтов, диалоги настроек |
+| Desktop UI | PySide6 / Qt 6 | Главное окно, таблица аккаунтов, диалоги настроек |
+| Web UI | React / Vite / Tailwind | Браузерная панель, realtime таблица, логи, actions |
+| Web backend | FastAPI / Uvicorn / WebSocket | `/api/*`, `/ws/events`, отдача React build |
 | Telegram MTProto | Telethon | Вход по телефону, хранение `.session`, запрос WebView для Mini App |
 | HTTP/TLS | curl_cffi | Запросы к `api2.gamee.com`, cookie jar, Android Chrome impersonation |
 | Конфиг | PyYAML | `config.yaml`, `accounts.yaml` |
@@ -71,6 +107,20 @@ MainWindow
   -> SettingsDialog
   -> AddAccountDialog
   -> EnterCodeDialog / EnterCodeThread
+
+web_main.py
+  -> FastAPI app
+     -> WebRuntime
+        -> BotWorker
+        -> AccountActionThread / EnterCodeThread
+     -> AppStateStore
+        -> /api/state
+        -> /ws/events
+
+web/
+  -> React UI
+     -> REST actions
+     -> WebSocket live updates
 ```
 
 ### Как Идёт Работа По Одному Аккаунту
@@ -120,6 +170,7 @@ MainWindow
 
 - Windows;
 - Python 3.13+;
+- Node.js/npm для сборки `web/`;
 - доступ в интернет до Telegram и `api2.gamee.com`;
 - установленный `curl_cffi >= 0.15.0`.
 
@@ -146,7 +197,7 @@ py -3 -m pip install -r requirements.txt
 py -3 -c "import curl_cffi; print(curl_cffi.__version__)"
 ```
 
-## Первый Запуск
+## Первый Запуск Desktop UI
 
 ```powershell
 py -3 main.py
@@ -162,6 +213,35 @@ py -3 main.py
 
 - `config.yaml`
 - `accounts.yaml`
+
+## Первый Запуск Web UI
+
+Установи Python-зависимости:
+
+```powershell
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Собери React UI:
+
+```powershell
+cd web
+npm install
+npm.cmd run build
+cd ..
+```
+
+Запусти локальную web-панель:
+
+```powershell
+.\.venv\Scripts\python web_main.py
+```
+
+Открой:
+
+```text
+http://127.0.0.1:8000
+```
 
 ## Основные Файлы
 
@@ -195,8 +275,14 @@ compliance:
   quiet_hours_enabled: false
   quiet_hours_start_hour: 0
   quiet_hours_end_hour: 8
-  daily_move_budget: 30
+  daily_move_budget: 0  # 0 = без дневного лимита ходов
   max_moves_per_session: 8
+  fast_bootstrap_enabled: true
+  bootstrap_account_stagger_min_seconds: 0.1
+  bootstrap_account_stagger_max_seconds: 0.4
+  bootstrap_move_delay_min_seconds: 6.0
+  bootstrap_move_delay_max_seconds: 7.5
+  steady_energy_targets: [10, 15, 20]
   error_cooldown_seconds: 30
   stop_after_error_streak: 3
 
@@ -248,6 +334,10 @@ telegram:
 - `Фоновый режим`;
 - дневной бюджет ходов;
 - максимум ходов за одну сессию;
+- быстрый первый проход;
+- stagger запуска аккаунтов;
+- пауза между ходами в bootstrap;
+- steady energy targets (`10`, `15`, `20` и т.п.);
 - cooldown после ошибок;
 - stop-after-error-streak;
 - quiet hours;
@@ -260,6 +350,8 @@ telegram:
 - то есть по факту стартует sync + награды + ходы для всех аккаунтов;
 - лимита по длительности фоновой сессии больше нет: фон работает до `Остановить всё`;
 - сохранённый `background_mode` всё равно остаётся в конфиге и используется как часть общих лимитов/настроек.
+- в bootstrap ходы идут до `energy < 5`, без дневного бюджета и без длинных burst-пауз;
+- после каждого броска софт ждёт анимацию кубика `6-7.5с`, а если выпала награда/коробка, добавляет ещё `3-4.5с`.
 
 ### Вкладка `Уведомления`
 
@@ -317,7 +409,7 @@ telegram:
 
 ## Как Пользоваться Софтом
 
-### Главное Окно
+### Desktop UI
 
 В окне есть:
 
@@ -328,6 +420,19 @@ telegram:
 - кнопка `Удалить выбранный...`;
 - кнопка `Прокси выбранного...`;
 - нижний лог событий.
+
+### Web UI
+
+В браузере есть:
+
+- кнопки `Запустить всё` и `Остановить всё`;
+- переключатель `Белый фон` / `Чёрный фон`;
+- realtime таблица аккаунтов;
+- отдельное окно логов с внутренним скроллом;
+- фильтр по аккаунтам/статусу;
+- фильтры логов: все, info, ходы, daily, season, ошибки, fatal;
+- drawer выбранного аккаунта: sync, claim daily, play session, proxy, delete;
+- массовая отправка промокода.
 
 ### Таблица Аккаунтов
 
@@ -356,7 +461,7 @@ telegram:
 - забирает daily reward;
 - проверяет сезонные награды;
 - делает ходы, пока есть энергия и позволяют лимиты;
-- пишет действия в нижний лог.
+- пишет действия в лог текущего интерфейса.
 
 ### Кнопка `Остановить Всё`
 
@@ -387,7 +492,9 @@ telegram:
 
 ## Логи
 
-Нижняя панель лога показывает:
+Desktop UI показывает лог в нижней панели. Web UI показывает лог в отдельном фиксированном окне: страница не растягивается от большого количества строк, список логов прокручивается внутри блока.
+
+Лог показывает:
 
 - старт и остановку фоновой сессии;
 - успешную синхронизацию аккаунтов;
@@ -409,8 +516,9 @@ telegram:
 5. забирает daily reward, если она доступна;
 6. забирает сезонные награды;
 7. делает серию ходов, пока хватает энергии;
-8. пишет статус в таблицу и в лог;
-9. уходит в sleep до расчётного регена энергии или в короткий retry после ошибки.
+8. после броска ждёт анимацию кубика и, при награде/коробке, дополнительную анимацию результата;
+9. пишет статус в таблицу и в лог;
+10. уходит в sleep до расчётного регена энергии или в короткий retry после ошибки.
 
 Скорость регулируется:
 
@@ -418,7 +526,8 @@ telegram:
 - небольшими паузами между стартом потоков;
 - cooldown после серий ошибок;
 - quiet hours;
-- дневным лимитом ходов и лимитом ходов за сессию.
+- дневным лимитом ходов и лимитом ходов за сессию;
+- отдельной bootstrap-паузой после броска, чтобы не пропускать визуальную анимацию результата.
 
 ### Порог Энергии И Сон До Регена
 
@@ -427,7 +536,9 @@ telegram:
 Текущая логика:
 
 - стоимость одного хода: `5` энергии;
-- стартовая энергия для серии ходов выбирается стабильно по `label`: `10`, `15` или `20`;
+- при каждом `Запустить всё` сначала идёт быстрый первый проход;
+- в bootstrap аккаунт быстро делает sync/claim/play и сливает доступную энергию до `energy < 5`;
+- после bootstrap аккаунт выбирает следующий steady target из `steady_energy_targets`, обычно `10`, `15` или `20`;
 - после старта серии ходы идут до конца, пока энергия остаётся `>= 5`;
 - если сервер отдаёт `nextLiveAddedTimestamp`, он используется как время ближайшего `+1` энергии;
 - недостающая энергия сверх ближайшего `+1` считается как `10 минут` за каждую единицу;
@@ -449,16 +560,31 @@ telegram:
 
 ## Полезные Команды
 
-Установка зависимостей:
+Установка Python-зависимостей:
 
 ```powershell
 py -3 -m pip install -r requirements.txt
 ```
 
-Запуск:
+Запуск desktop UI:
 
 ```powershell
 py -3 main.py
+```
+
+Сборка web UI:
+
+```powershell
+cd web
+npm install
+npm.cmd run build
+cd ..
+```
+
+Запуск web UI:
+
+```powershell
+py -3 web_main.py
 ```
 
 Проверить, что `curl_cffi` достаточно новый:
@@ -494,7 +620,7 @@ Gamee валидирует JSON-RPC `id`. В рабочих запросах `id
 
 Проверь:
 
-- нижний лог;
+- лог текущего UI;
 - корректность прокси;
 - quiet hours;
 - лимиты `daily_move_budget`, `max_moves_per_session`;
@@ -513,7 +639,7 @@ Gamee валидирует JSON-RPC `id`. В рабочих запросах `id
 ## Кратко По Ежедневному Сценарию
 
 1. Установи зависимости.
-2. Запусти `main.py`.
+2. Запусти `main.py` для desktop UI или `web_main.py` для web UI.
 3. Открой `Настройки...` и впиши `api_id` / `api_hash`.
 4. Добавь аккаунты через `Добавить аккаунт...`.
 5. При необходимости проверь прокси.
