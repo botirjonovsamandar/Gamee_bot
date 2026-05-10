@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import gc
-from datetime import datetime, timezone
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
 from gamee_bot.account_store import load_accounts
 from gamee_bot.client import GameeClient, GameeSession
+from gamee_bot.daily_schedule import daily_available_by_schedule, next_daily_reset_utc
 from gamee_bot.http_profile import gamee_http_profile_for_label
 from gamee_bot.config import (
     AppConfig,
@@ -33,22 +33,9 @@ def _daily_checkin_preview_row(
     client: GameeClient, session: GameeSession
 ) -> tuple[str, str | None, int, int]:
     """Без клейма: подсказка, ISO таймера, streak и длина цикла (напр. 1/14)."""
-    snap = client.get_daily_checkin_snapshot(session)
-    if snap.api_error:
-        return "—", None, 0, 0
-    if not snap.claimed_today and snap.can_claim_now():
-        note = "можно забрать"
-    else:
-        note = ""
-    iso: str | None = None
-    if snap.next_available_utc is not None:
-        now = datetime.now(timezone.utc)
-        na = snap.next_available_utc
-        if na.tzinfo is None:
-            na = na.replace(tzinfo=timezone.utc)
-        if now < na:
-            iso = na.isoformat()
-    return note, iso, snap.streak, snap.streak_total
+    if daily_available_by_schedule():
+        return "проверка при ходах", None, 0, 0
+    return "ожидание 17:00 UZ", next_daily_reset_utc().isoformat(), 0, 0
 
 
 class AccountsPreviewLoader(QThread):

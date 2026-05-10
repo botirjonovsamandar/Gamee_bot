@@ -115,6 +115,45 @@ def _jsonrpc_message_suggests_relogin(message: str) -> bool:
     )
 
 
+def _jsonrpc_error_code(err: Any) -> int | None:
+    if not isinstance(err, dict):
+        return None
+    try:
+        return int(err.get("code"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _jsonrpc_error_message(err: Any) -> str:
+    if not isinstance(err, dict):
+        return str(err)
+    msg = str(err.get("message", "") or "").strip()
+    data = err.get("data")
+    details: list[str] = []
+    if isinstance(data, dict):
+        for key in ("reason", "code", "name", "message"):
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                details.append(f"{key}={value}")
+    elif data is not None and str(data).strip():
+        details.append(str(data))
+    code = _jsonrpc_error_code(err)
+    if code is not None and msg:
+        msg = f"{msg} (code={code})"
+    elif code is not None:
+        msg = f"code={code}"
+    if details:
+        msg = f"{msg}: {', '.join(details)}" if msg else ", ".join(details)
+    return msg or str(err)
+
+
+def _jsonrpc_error_suggests_relogin(err: Any) -> bool:
+    # Matches the public web client's CODE_ENTITY_EXPIRED handling.
+    if _jsonrpc_error_code(err) in {-32005, 401, 419, 498}:
+        return True
+    return _jsonrpc_message_suggests_relogin(_jsonrpc_error_message(err))
+
+
 def _board_get_error_is_missing_reward_progress(berr: Any) -> bool:
     """
     luckyGame.board.get иногда отвечает, что нет rewarded progress по доске
@@ -438,10 +477,24 @@ def _format_rewards_flat_list(rewards: list[dict[str, Any]], divisor: int) -> st
     return ", ".join(parts)
 
 
+def _json_bool_or_none(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return None
+
+
 def _format_check_task_code_result(result: dict[str, Any], cfg: GameeConfig) -> str:
     """Человекочитаемо: ответ telegram.checkTask.code (rewards + completed)."""
     parts: list[str] = []
-    if result.get("completed") is True:
+    if _json_bool_or_none(result.get("completed")) is True:
         parts.append("выполнено")
     rewards = result.get("rewards")
     if not isinstance(rewards, list):
@@ -482,9 +535,14 @@ class DailyCheckinSnapshot:
     streak: int
     streak_total: int = 0  # len(dailyCheckinDays), обычно 14
     api_error: str | None = None
+    claim_available: bool | None = None
 
     def can_claim_now(self, now: datetime | None = None) -> bool:
-        if self.api_error or self.claimed_today:
+        if self.api_error:
+            return False
+        if self.claim_available is not None:
+            return bool(self.claim_available)
+        if self.claimed_today:
             return False
         if now is None:
             now = datetime.now(timezone.utc)
@@ -496,9 +554,75 @@ class DailyCheckinSnapshot:
         return now >= na
 
 
+def _daily_claim_available_from_result(result: dict[str, Any]) -> bool | None:
+    flag_keys = (
+        "claimAvailable",
+        "canClaim",
+        "canClaimToday",
+        "availableToClaim",
+        "isClaimAvailable",
+    )
+    for key in (
+        *flag_keys,
+        "claimable",
+    ):
+        if key in result:
+            value = _json_bool_or_none(result.get(key))
+            if value is not None:
+                return value
+    status = str(result.get("status") or result.get("state") or "").strip().lower()
+    if status in {"available", "claimable", "ready", "can_claim"}:
+        return True
+    if status in {"claimed", "locked", "unavailable", "not_available", "cooldown"}:
+        return False
+    days = result.get("dailyCheckinDays")
+    if not isinstance(days, list):
+        return None
+    saw_false = False
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        for key in (*flag_keys, "claimable"):
+            if key not in day:
+                continue
+            value = _json_bool_or_none(day.get(key))
+            if value is True:
+                return True
+            if value is False:
+                saw_false = True
+        day_status = str(day.get("status") or day.get("state") or "").strip().lower()
+        if day_status in {"available", "claimable", "ready", "can_claim"}:
+            return True
+        if day_status in {"claimed", "locked", "unavailable", "not_available", "cooldown"}:
+            saw_false = True
+        for nested_key in ("reward", "dailyReward", "prize"):
+            nested = day.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in flag_keys:
+                if key not in nested:
+                    continue
+                value = _json_bool_or_none(nested.get(key))
+                if value is True:
+                    return True
+                if value is False:
+                    saw_false = True
+    return False if saw_false else None
+
+
 def _daily_checkin_from_result(result: dict[str, Any]) -> DailyCheckinSnapshot:
-    claimed = bool(result.get("claimedToday"))
-    next_dt = _parse_iso_datetime_utc(result.get("nextClaimAvailableTimestamp"))
+    claimed = _json_bool_or_none(result.get("claimedToday")) is True
+    next_dt = None
+    for key in (
+        "nextClaimAvailableTimestamp",
+        "nextDailyClaimTimestamp",
+        "nextAvailableTimestamp",
+        "nextClaimTimestamp",
+    ):
+        next_dt = _parse_iso_datetime_utc(result.get(key))
+        if next_dt is not None:
+            break
+    claim_available = _daily_claim_available_from_result(result)
     try:
         streak = int(result.get("streak") or 0)
     except (TypeError, ValueError):
@@ -511,6 +635,7 @@ def _daily_checkin_from_result(result: dict[str, Any]) -> DailyCheckinSnapshot:
         streak=streak,
         streak_total=streak_total,
         api_error=None,
+        claim_available=claim_available,
     )
 
 
@@ -1175,30 +1300,48 @@ class GameeClient:
             self._try_link_telegram_referral(session)
 
     def submit_check_task_code(
-        self, session: GameeSession, *, task_id: int, code: str
+        self, session: GameeSession, *, task_id: int, code: str, _relogin: bool = False
     ) -> tuple[bool, str]:
         """telegram.checkTask.code — промокод с prizes.gamee.com (см. HAR)."""
         raw = (code or "").strip()
         if not raw:
             return False, "пустой код"
+        try:
+            tid = int(task_id)
+        except (TypeError, ValueError):
+            return False, "Task ID должен быть числом"
+        if tid < 1:
+            return False, "Task ID должен быть положительным"
         self.ensure_session(session)
         body = [
             {
                 "jsonrpc": "2.0",
                 "id": "telegram.checkTask.code",
                 "method": "telegram.checkTask.code",
-                "params": {"taskId": int(task_id), "code": raw},
+                "params": {"taskId": tid, "code": raw},
             }
         ]
         rows = self._post_batch(session, body)
         row = self._by_id(rows, "telegram.checkTask.code")
         if "error" in row:
             err = row["error"]
-            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-            return False, str(msg)
+            if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                self._force_relogin(session)
+                return self.submit_check_task_code(
+                    session, task_id=tid, code=raw, _relogin=True
+                )
+            return False, _jsonrpc_error_message(err)
         result = row.get("result")
         if not isinstance(result, dict):
             return True, "OK"
+        if _json_bool_or_none(result.get("completed")) is False:
+            reason_parts: list[str] = []
+            for key in ("message", "reason", "status", "state", "error", "code"):
+                value = result.get(key)
+                if value is not None and str(value).strip():
+                    reason_parts.append(f"{key}={value}")
+            reason = ", ".join(reason_parts)
+            return False, f"не выполнено{': ' + reason if reason else ''}"
         return True, _format_check_task_code_result(result, self._cfg)
 
     def get_assets_state(self, session: GameeSession, _relogin: bool = False) -> AccountGameState:

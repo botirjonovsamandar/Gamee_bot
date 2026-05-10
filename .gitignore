@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 web/node_modules/
@@ -12,8 +16,19 @@ accounts.yaml
 config.yaml
 sessions/
 *.session
+*.session-journal
+*.sqlite
+*.sqlite3
+*.db
 *.har
 .env
-CLAUDE.md
+.env.*
+!.env.example
+*.log
+logs/
+tmp/
+temp/
 
-# полный clone для публикации на GitHub (не дублируем в этом репозитории)
+# локальные IDE/агентские файлы
+.idea/
+.vscode/

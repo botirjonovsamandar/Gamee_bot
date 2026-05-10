@@ -226,6 +226,11 @@ class WebRuntime:
             cfg = self._cfg_ready()
             self._ensure_can_use_transport(cfg)
             tid = int(task_id if task_id is not None else cfg.gamee.check_task_id)
+            if tid < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Task ID должен быть положительным.",
+                )
             thread = EnterCodeThread(cfg, code, tid)
             thread.log_line.connect(self._on_log, Qt.ConnectionType.DirectConnection)
             thread.finished.connect(

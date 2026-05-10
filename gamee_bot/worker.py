@@ -44,6 +44,12 @@ from gamee_bot.client import (
     GameeTransientServerError,
     PlayOutcome,
 )
+from gamee_bot.daily_schedule import (
+    daily_available_by_schedule,
+    daily_claim_key,
+    next_daily_claim_key,
+    next_daily_reset_utc,
+)
 from gamee_bot.http_profile import gamee_http_profile_for_label
 from gamee_bot.config import (
     BACKGROUND_MODE_FULL_AUTO,
@@ -251,6 +257,8 @@ class BotWorker(QThread):
         # daily_move_budget tracking: (UTC date str) -> {label -> count}
         self._daily_moves: dict[str, dict[str, int]] = {}
         self._daily_moves_lock = threading.Lock()
+        self._daily_status_log_keys: set[tuple[str, str, str]] = set()
+        self._daily_status_log_lock = threading.Lock()
         # Per-session mood (назначается при run()): good/neutral/bad
         self._session_mood: SessionMood = SessionMood(name="neutral", delay_multiplier=1.0)
         # Markov-like speed state per-account (BEH-3)
@@ -467,6 +475,20 @@ class BotWorker(QThread):
             stale = [k for k in self._daily_moves if k != key]
             for k in stale:
                 del self._daily_moves[k]
+
+    def _log_daily_status_once(
+        self, label: str, day_key: str, status_key: str, message: str
+    ) -> None:
+        key = (label, day_key, status_key)
+        with self._daily_status_log_lock:
+            if key in self._daily_status_log_keys:
+                return
+            if len(self._daily_status_log_keys) > 10000:
+                self._daily_status_log_keys = {
+                    k for k in self._daily_status_log_keys if k[1] == day_key
+                }
+            self._daily_status_log_keys.add(key)
+        self.log_message.emit(message)
 
     def set_telegram_notify_enabled(self, enabled: bool) -> None:
         """Вкл/выкл отправку уведомлений бота в Telegram (ходы, ежедневка, сезон, сводка)."""
@@ -689,6 +711,8 @@ class BotWorker(QThread):
         self._speed_state.clear()
         self._second_session_at.clear()
         self._season_sync_due_at.clear()
+        with self._daily_status_log_lock:
+            self._daily_status_log_keys.clear()
         self._bootstrap_pending_labels.clear()
         self._bootstrap_started_labels.clear()
         self._bootstrap_done_labels.clear()
@@ -947,31 +971,102 @@ class BotWorker(QThread):
         *,
         allow_claim: bool,
         fast: bool = False,
-    ) -> None:
-        snap = client.get_daily_checkin_snapshot(session)
-        day_key_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ) -> bool:
+        now_utc = datetime.now(timezone.utc)
+        next_reset = next_daily_reset_utc(now_utc)
+        if not daily_available_by_schedule(now_utc):
+            next_key = next_daily_claim_key(now_utc)
+            wait = max(0.0, (next_reset - now_utc).total_seconds())
+            with self._state_lock:
+                row = self._rows.get(label)
+                if row is not None:
+                    row.daily_claim_rewards_text = "ожидание 17:00 UZ"
+                    row.daily_checkin_deadline_iso = next_reset.isoformat()
+                    self._rows[label] = row
+            self._log_daily_status_once(
+                label,
+                next_key,
+                "before_17_uz",
+                f"[{label}] Ежедневная награда будет доступна через "
+                f"~{_format_wait_duration(wait)} (17:00 UZ).",
+            )
+            self._emit_table()
+            return False
+
+        day_key = daily_claim_key(now_utc)
         with self._state_lock:
             row = self._rows.get(label)
             persisted_rw = (row.daily_claim_rewards_text if row else "") or ""
             persisted_day = (row.daily_bot_claim_day_key if row else "") or ""
+            current_streak = int(row.daily_checkin_streak if row else 0)
+            current_streak_total = int(row.daily_checkin_streak_total if row else 0)
+
+        if persisted_day == day_key:
+            with self._state_lock:
+                row = self._rows.get(label)
+                if row is not None:
+                    row.daily_claim_rewards_text = persisted_rw or "уже забрана"
+                    row.daily_checkin_deadline_iso = next_reset.isoformat()
+                    self._rows[label] = row
+            self._emit_table()
+            return False
+
+        snap = client.get_daily_checkin_snapshot(session)
 
         iso: str | None = None
         last_rw = ""
         bot_day = ""
+        can_claim_now = False
+        claimed_reward = False
 
         if snap.api_error:
             self._note_account_error(label)
             last_rw = "ежедн. — ошибка"
-        elif snap.claimed_today:
-            if persisted_day == day_key_utc and persisted_rw:
-                last_rw = persisted_rw
-                bot_day = persisted_day
+            self.log_message.emit(
+                f"[{label}] Ежедневная награда: проверка не удалась — {snap.api_error}"
+            )
         else:
-            last_rw = ""
+            can_claim_now = snap.can_claim_now()
+            if snap.claimed_today and not can_claim_now:
+                if persisted_day == day_key and persisted_rw:
+                    last_rw = persisted_rw
+                else:
+                    last_rw = "уже забрана"
+                bot_day = day_key
+                self._log_daily_status_once(
+                    label,
+                    day_key,
+                    "claimed_by_api",
+                    f"[{label}] Ежедневная награда: по API уже забрана сегодня.",
+                )
+            else:
+                last_rw = ""
 
-        will_try_claim = (
-            not snap.api_error and allow_claim and not snap.claimed_today
-        )
+            if can_claim_now and not allow_claim:
+                self._log_daily_status_once(
+                    label,
+                    day_key,
+                    "available_autoclaim_off",
+                    f"[{label}] Ежедневная награда доступна, но автоклейм выключен.",
+                )
+            elif not can_claim_now and not snap.claimed_today:
+                wait_note = ""
+                if snap.next_available_utc is not None:
+                    na = snap.next_available_utc
+                    if na.tzinfo is None:
+                        na = na.replace(tzinfo=timezone.utc)
+                    if now_utc < na:
+                        wait_note = f" Будет доступна через ~{_format_wait_duration((na - now_utc).total_seconds())}."
+                if not wait_note:
+                    wait_note = " Повторная проверка будет только при следующей серии ходов."
+                self._log_daily_status_once(
+                    label,
+                    day_key,
+                    "not_available",
+                    f"[{label}] Ежедневная награда пока недоступна.{wait_note}",
+                )
+
+        will_try_claim = not snap.api_error and allow_claim and can_claim_now
         if will_try_claim:
             with self._state_lock:
                 row = self._rows.get(label)
@@ -980,11 +1075,12 @@ class BotWorker(QThread):
                     self._rows[label] = row
             self._emit_table()
 
-        if not snap.api_error and allow_claim and not snap.claimed_today:
+        if will_try_claim:
             ok, rw, snap2 = client.claim_daily_checkin(session)
             if ok:
                 last_rw = rw if rw.strip() not in ("", "—") else "OK"
-                bot_day = day_key_utc
+                bot_day = day_key
+                claimed_reward = True
                 self.log_message.emit(f"[{label}] Ежедневная награда: {last_rw}")
                 snap = snap2 or client.get_daily_checkin_snapshot(session)
                 streak_n, streak_tot = 0, 0
@@ -1023,10 +1119,10 @@ class BotWorker(QThread):
                 err_hint = (rw or "").strip() or "клейм не удался"
                 self.log_message.emit(f"[{label}] Ежедневная награда не взята: {err_hint}")
                 snap = client.get_daily_checkin_snapshot(session)
-                if snap.claimed_today and persisted_day == day_key_utc and persisted_rw:
-                    last_rw = persisted_rw
-                    bot_day = persisted_day
-                elif snap.claimed_today:
+                if snap.claimed_today:
+                    last_rw = persisted_rw if persisted_day == day_key and persisted_rw else "уже забрана"
+                    bot_day = day_key
+                else:
                     last_rw = ""
                     bot_day = ""
                 with self._state_lock:
@@ -1036,12 +1132,13 @@ class BotWorker(QThread):
                         self._rows[label] = row
                 self._emit_table()
 
-        if not snap.api_error and snap.next_available_utc is not None:
-            now = datetime.now(timezone.utc)
+        if bot_day == day_key:
+            iso = next_reset.isoformat()
+        elif not snap.api_error and snap.next_available_utc is not None:
             na = snap.next_available_utc
             if na.tzinfo is None:
                 na = na.replace(tzinfo=timezone.utc)
-            if now < na:
+            if now_utc < na:
                 iso = na.isoformat()
 
         if snap.api_error:
@@ -1050,7 +1147,7 @@ class BotWorker(QThread):
         if not snap.api_error:
             streak_n, streak_tot = snap.streak, snap.streak_total
         else:
-            streak_n, streak_tot = 0, 0
+            streak_n, streak_tot = current_streak, current_streak_total
 
         with self._state_lock:
             row = self._rows.get(label)
@@ -1061,6 +1158,8 @@ class BotWorker(QThread):
                 row.daily_checkin_streak = streak_n
                 row.daily_checkin_streak_total = streak_tot
                 self._rows[label] = row
+        self._emit_table()
+        return claimed_reward
 
     def _apply_season_pass(
         self,
@@ -1234,50 +1333,15 @@ class BotWorker(QThread):
                 self._rows[label] = row
 
             if not state.last_error:
-                # Randomize order of pre-play checks (human-like behavior)
-                _do_season_first = random.random() < 0.5
-                if _do_season_first:
-                    self._apply_season_pass(
-                        client,
-                        session,
-                        label,
-                        claim=self._background_mode_allows_claims(),
-                        force=self._background_mode_allows_claims(),
-                        notifier=notifier if self._background_mode_allows_claims() else None,
-                    )
-                    self._emit_table()
-                    self._apply_daily_checkin(
-                        client,
-                        session,
-                        label,
-                        allow_claim=self._background_mode_allows_claims(),
-                        fast=bootstrap,
-                    )
-                else:
-                    self._apply_daily_checkin(
-                        client,
-                        session,
-                        label,
-                        allow_claim=self._background_mode_allows_claims(),
-                        fast=bootstrap,
-                    )
-                    self._apply_season_pass(
-                        client,
-                        session,
-                        label,
-                        claim=self._background_mode_allows_claims(),
-                        force=self._background_mode_allows_claims(),
-                        notifier=notifier if self._background_mode_allows_claims() else None,
-                    )
-                    self._emit_table()
-            else:
-                self._apply_daily_checkin(
+                self._apply_season_pass(
                     client,
                     session,
                     label,
-                    allow_claim=self._background_mode_allows_claims(),
-                    fast=bootstrap,
+                    claim=self._background_mode_allows_claims(),
+                    force=self._background_mode_allows_claims(),
+                    notifier=notifier if self._background_mode_allows_claims() else None,
                 )
+                self._emit_table()
 
             if state.last_error:
                 self._emit_table()
@@ -1315,6 +1379,32 @@ class BotWorker(QThread):
                     self._complete_bootstrap_if_pending(label, state)
                 self._emit_table()
                 return
+
+            daily_claimed = self._apply_daily_checkin(
+                client,
+                session,
+                label,
+                allow_claim=self._background_mode_allows_claims(),
+                fast=bootstrap,
+            )
+            if daily_claimed:
+                state2 = client.get_assets_state(session)
+                if not state2.last_error:
+                    state = state2
+                    self._note_account_success(label)
+                    with self._state_lock:
+                        row = self._rows.get(label) or RowState(
+                            label=label, energy=0, gold=0, usd_cents=0
+                        )
+                        row.energy = state.energy
+                        row.gold = state.gold
+                        row.usd_cents = state.usd_cents
+                        row.gold_estimated_usd = state.gold_estimated_usd
+                        row.regen_deadline_utc = state.next_live_at_utc
+                        self._rows[label] = row
+                    self._emit_table()
+                else:
+                    self._note_account_error(label)
 
             # ── Энергию ВСЕГДА сливаем до конца (как реальные юзеры) ──
             # Quick/Deep sessions отключены — сливаем до 0 (energy < ENERGY_COST_PER_MOVE).
