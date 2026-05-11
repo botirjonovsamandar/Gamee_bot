@@ -1366,20 +1366,6 @@ class BotWorker(QThread):
                     self._note_account_error(label)
 
             bootstrap = self._is_bootstrap_pending(label)
-            reached_steady_target: int | None = None
-            if not bootstrap:
-                reached_steady_target = self._note_steady_wakeup_if_due(label, state.energy)
-            threshold = (
-                ENERGY_COST_PER_MOVE
-                if bootstrap
-                else reached_steady_target or self._steady_energy_target_for_label(label)
-            )
-            if state.energy < threshold:
-                if bootstrap and state.energy < ENERGY_COST_PER_MOVE:
-                    self._complete_bootstrap_if_pending(label, state)
-                self._emit_table()
-                return
-
             daily_claimed = self._apply_daily_checkin(
                 client,
                 session,
@@ -1405,6 +1391,20 @@ class BotWorker(QThread):
                     self._emit_table()
                 else:
                     self._note_account_error(label)
+
+            reached_steady_target: int | None = None
+            if not bootstrap:
+                reached_steady_target = self._note_steady_wakeup_if_due(label, state.energy)
+            threshold = (
+                ENERGY_COST_PER_MOVE
+                if bootstrap
+                else reached_steady_target or self._steady_energy_target_for_label(label)
+            )
+            if state.energy < threshold:
+                if bootstrap and state.energy < ENERGY_COST_PER_MOVE:
+                    self._complete_bootstrap_if_pending(label, state)
+                self._emit_table()
+                return
 
             # ── Энергию ВСЕГДА сливаем до конца (как реальные юзеры) ──
             # Quick/Deep sessions отключены — сливаем до 0 (energy < ENERGY_COST_PER_MOVE).

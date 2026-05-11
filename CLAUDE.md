@@ -150,7 +150,7 @@ Behavior:
 - Daily reward timing is centralized in `gamee_bot/daily_schedule.py`.
 - The reset is `17:00 UZ` (`UTC+5`).
 - Before reset, preview rows show waiting state and the worker logs the next availability once per account/day.
-- After reset, `_apply_daily_checkin()` checks and claims daily during the normal account loop.
+- After reset, `_apply_daily_checkin()` checks and claims daily during the normal account loop before the energy-threshold return path.
 - Claimed daily state is keyed by the UZ claim day, so the worker does not repeatedly claim before the next reset.
 
 ### Promo Code Behavior

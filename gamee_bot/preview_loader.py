@@ -34,7 +34,7 @@ def _daily_checkin_preview_row(
 ) -> tuple[str, str | None, int, int]:
     """Без клейма: подсказка, ISO таймера, streak и длина цикла (напр. 1/14)."""
     if daily_available_by_schedule():
-        return "проверка при ходах", None, 0, 0
+        return "проверка при запуске", None, 0, 0
     return "ожидание 17:00 UZ", next_daily_reset_utc().isoformat(), 0, 0
 
 

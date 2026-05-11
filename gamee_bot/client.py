@@ -578,7 +578,6 @@ def _daily_claim_available_from_result(result: dict[str, Any]) -> bool | None:
     days = result.get("dailyCheckinDays")
     if not isinstance(days, list):
         return None
-    saw_false = False
     for day in days:
         if not isinstance(day, dict):
             continue
@@ -588,13 +587,9 @@ def _daily_claim_available_from_result(result: dict[str, Any]) -> bool | None:
             value = _json_bool_or_none(day.get(key))
             if value is True:
                 return True
-            if value is False:
-                saw_false = True
         day_status = str(day.get("status") or day.get("state") or "").strip().lower()
         if day_status in {"available", "claimable", "ready", "can_claim"}:
             return True
-        if day_status in {"claimed", "locked", "unavailable", "not_available", "cooldown"}:
-            saw_false = True
         for nested_key in ("reward", "dailyReward", "prize"):
             nested = day.get(nested_key)
             if not isinstance(nested, dict):
@@ -605,9 +600,7 @@ def _daily_claim_available_from_result(result: dict[str, Any]) -> bool | None:
                 value = _json_bool_or_none(nested.get(key))
                 if value is True:
                     return True
-                if value is False:
-                    saw_false = True
-    return False if saw_false else None
+    return None
 
 
 def _daily_checkin_from_result(result: dict[str, Any]) -> DailyCheckinSnapshot:
