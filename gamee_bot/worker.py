@@ -663,6 +663,19 @@ class BotWorker(QThread):
             target_energy=threshold,
             regen_deadline_utc=row.regen_deadline_utc,
         )
+        if not daily_available_by_schedule():
+            next_key = next_daily_claim_key()
+            if row.daily_bot_claim_day_key != next_key:
+                next_reset = next_daily_reset_utc()
+                now = datetime.now(timezone.utc)
+                daily_delay = max(0.0, (next_reset - now).total_seconds())
+                daily_delay += random.uniform(1.0, 12.0)
+                if daily_delay < delay:
+                    self._set_row_status(
+                        label,
+                        f"ожидание daily 17:00 UZ (~{_format_wait_duration(daily_delay)})",
+                    )
+                    return daily_delay
         if bootstrap and row.energy < ENERGY_COST_PER_MOVE:
             state = AccountGameState(
                 energy=row.energy,
@@ -1001,11 +1014,17 @@ class BotWorker(QThread):
             current_streak = int(row.daily_checkin_streak if row else 0)
             current_streak_total = int(row.daily_checkin_streak_total if row else 0)
 
-        if persisted_day == day_key:
+        trusted_persisted_claim = (
+            persisted_day == day_key
+            and bool(persisted_rw.strip())
+            and persisted_rw.strip().lower() not in {"уже забрана", "already claimed"}
+            and not persisted_rw.strip().lower().startswith("не взята")
+        )
+        if trusted_persisted_claim:
             with self._state_lock:
                 row = self._rows.get(label)
                 if row is not None:
-                    row.daily_claim_rewards_text = persisted_rw or "уже забрана"
+                    row.daily_claim_rewards_text = persisted_rw
                     row.daily_checkin_deadline_iso = next_reset.isoformat()
                     self._rows[label] = row
             self._emit_table()
@@ -1028,17 +1047,16 @@ class BotWorker(QThread):
         else:
             can_claim_now = snap.can_claim_now()
             if snap.claimed_today and not can_claim_now:
-                if persisted_day == day_key and persisted_rw:
-                    last_rw = persisted_rw
-                else:
-                    last_rw = "уже забрана"
-                bot_day = day_key
+                last_rw = ""
                 self._log_daily_status_once(
                     label,
                     day_key,
-                    "claimed_by_api",
-                    f"[{label}] Ежедневная награда: по API уже забрана сегодня.",
+                    "claimed_by_api_probe",
+                    f"[{label}] Ежедневная награда: API пишет, что уже забрана; "
+                    "проверяю claim напрямую.",
                 )
+                if allow_claim:
+                    can_claim_now = True
             else:
                 last_rw = ""
 
@@ -1119,12 +1137,8 @@ class BotWorker(QThread):
                 err_hint = (rw or "").strip() or "клейм не удался"
                 self.log_message.emit(f"[{label}] Ежедневная награда не взята: {err_hint}")
                 snap = client.get_daily_checkin_snapshot(session)
-                if snap.claimed_today:
-                    last_rw = persisted_rw if persisted_day == day_key and persisted_rw else "уже забрана"
-                    bot_day = day_key
-                else:
-                    last_rw = ""
-                    bot_day = ""
+                last_rw = f"не взята: {err_hint}"
+                bot_day = ""
                 with self._state_lock:
                     row = self._rows.get(label)
                     if row is not None:

@@ -151,7 +151,8 @@ Behavior:
 - The reset is `17:00 UZ` (`UTC+5`).
 - Before reset, preview rows show waiting state and the worker logs the next availability once per account/day.
 - After reset, `_apply_daily_checkin()` checks and claims daily during the normal account loop before the energy-threshold return path.
-- Claimed daily state is keyed by the UZ claim day, so the worker does not repeatedly claim before the next reset.
+- Energy sleep must not skip over the reset; `_idle_sleep_seconds_for_row()` wakes at `17:00 UZ` when the next claim day is not recorded.
+- `claimedToday` from `dailyCheckin.getInformation` is not enough to mark a UZ claim day as done; it triggers a direct `dailyCheckin.claim` probe. Only successful claim responses should write `daily_bot_claim_day_key`.
 
 ### Promo Code Behavior
 
