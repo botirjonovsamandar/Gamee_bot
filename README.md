@@ -624,6 +624,13 @@ py -3 web_main.py
 py -3 -c "import curl_cffi; print(curl_cffi.__version__)"
 ```
 
+Проверить git identity перед `commit`/`push`:
+
+```powershell
+git config --global user.name
+git config --global user.email
+```
+
 ## Типичные Проблемы
 
 ### `loginUsingTelegram: сервер отклонил запрос (code=-32603...)`
