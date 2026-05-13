@@ -39,6 +39,7 @@ from gamee_bot.behavior_profile import (
 )
 from gamee_bot.client import (
     AccountGameState,
+    ActivityRewardClaim,
     GameeClient,
     GameeSession,
     GameeTransientServerError,
@@ -154,6 +155,7 @@ STATUS_IDLE = "ожидание"
 STATUS_SYNCING = "синхронизация…"
 STATUS_DAILY_IN_PROGRESS = "ежедневная награда…"
 STATUS_DAILY_DONE = "ежедневная награда выполнена"
+STATUS_ACTIVITY_DONE = "задание получено"
 STATUS_MOVE_IN_PROGRESS = "бросок кубика…"
 STATUS_MOVE_DONE = "ход выполнен"
 STATUS_WATCHING_ANIMATION = "смотрит анимацию…"
@@ -1175,6 +1177,42 @@ class BotWorker(QThread):
         self._emit_table()
         return claimed_reward
 
+    def _apply_board_activity_rewards(
+        self,
+        client: GameeClient,
+        session: GameeSession,
+        label: str,
+    ) -> bool:
+        try:
+            claims: list[ActivityRewardClaim] = client.claim_board_activity_rewards(
+                session
+            )
+        except Exception as e:
+            msg = str(e).strip() or repr(e)
+            self.log_message.emit(
+                f"[{label}] Задания за ходы: клейм не удался — {msg}"
+            )
+            return False
+        if not claims:
+            return False
+
+        with self._state_lock:
+            row = self._rows.get(label)
+            if row is not None:
+                row.status = STATUS_ACTIVITY_DONE
+                self._rows[label] = row
+        for claim in claims:
+            reward_text = (
+                claim.rewards_text
+                if claim.rewards_text.strip() not in ("", "—")
+                else "OK"
+            )
+            self.log_message.emit(
+                f"[{label}] Задание {claim.name}: получено — {reward_text}"
+            )
+        self._emit_table()
+        return True
+
     def _apply_season_pass(
         self,
         client: GameeClient,
@@ -1356,6 +1394,31 @@ class BotWorker(QThread):
                     notifier=notifier if self._background_mode_allows_claims() else None,
                 )
                 self._emit_table()
+                if (
+                    self._background_mode_allows_claims()
+                    and self._apply_board_activity_rewards(
+                        client,
+                        session,
+                        label,
+                    )
+                ):
+                    state2 = client.get_assets_state(session)
+                    if not state2.last_error:
+                        state = state2
+                        self._note_account_success(label)
+                        with self._state_lock:
+                            row = self._rows.get(label) or RowState(
+                                label=label, energy=0, gold=0, usd_cents=0
+                            )
+                            row.energy = state.energy
+                            row.gold = state.gold
+                            row.usd_cents = state.usd_cents
+                            row.gold_estimated_usd = state.gold_estimated_usd
+                            row.regen_deadline_utc = state.next_live_at_utc
+                            self._rows[label] = row
+                        self._emit_table()
+                    else:
+                        self._note_account_error(label)
 
             if state.last_error:
                 self._emit_table()
@@ -1561,6 +1624,39 @@ class BotWorker(QThread):
                     after.tickets - before.tickets,
                     outcome.xp_gained,
                 )
+                should_check_activity_rewards = (
+                    self._background_mode_allows_claims()
+                    and (
+                        move_idx == 1
+                        or move_idx % 5 == 0
+                        or state.energy < ENERGY_COST_PER_MOVE
+                    )
+                )
+                if (
+                    should_check_activity_rewards
+                    and self._apply_board_activity_rewards(
+                        client,
+                        session,
+                        label,
+                    )
+                ):
+                    state2 = client.get_assets_state(session)
+                    if not state2.last_error:
+                        state = state2
+                        self._note_account_success(label)
+                        with self._state_lock:
+                            row = self._rows.get(label) or RowState(
+                                label=label, energy=0, gold=0, usd_cents=0
+                            )
+                            row.energy = state.energy
+                            row.gold = state.gold
+                            row.usd_cents = state.usd_cents
+                            row.gold_estimated_usd = state.gold_estimated_usd
+                            row.regen_deadline_utc = state.next_live_at_utc
+                            self._rows[label] = row
+                        self._emit_table()
+                    else:
+                        self._note_account_error(label)
                 if not bootstrap and not after.last_error:
                     self._apply_season_pass(
                         client,

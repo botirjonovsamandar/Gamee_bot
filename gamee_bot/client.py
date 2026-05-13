@@ -42,7 +42,10 @@ _BATCH_NOISE_METHODS = [
 # Methods that must NOT have their batch shuffled or padded (order-sensitive).
 _BATCH_NO_RANDOMIZE_IDS = frozenset({
     "user.authentication.loginUsingTelegram",
+    "user.claimActivity",
+    "user.getActivities",
 })
+_ACTIVITIES_PAGE_LIMIT = 25
 
 
 class GameeTransientServerError(RuntimeError):
@@ -477,6 +480,98 @@ def _format_rewards_flat_list(rewards: list[dict[str, Any]], divisor: int) -> st
     return ", ".join(parts)
 
 
+def _format_activity_rewards_blob(rewards: Any, divisor: int) -> str:
+    if isinstance(rewards, list):
+        return _format_rewards_flat_list(rewards, divisor)
+    if not isinstance(rewards, dict):
+        return "—"
+    parts: list[str] = []
+    virtual_tokens = rewards.get("virtualTokens")
+    if isinstance(virtual_tokens, list):
+        vt = _format_rewards_flat_list(virtual_tokens, divisor)
+        if vt and vt != "—":
+            parts.append(vt)
+    for key, label in (("gems", "Gem"), ("tickets", "Tickets")):
+        try:
+            amount = int(rewards.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        if amount > 0:
+            parts.append(f"{label} {amount}")
+    return ", ".join(parts) if parts else "—"
+
+
+def _activities_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = result.get("activities")
+    if isinstance(raw, dict):
+        for key in ("items", "activities", "data"):
+            nested = raw.get(key)
+            if isinstance(nested, list):
+                raw = nested
+                break
+    if not isinstance(raw, list):
+        return []
+    return [a for a in raw if isinstance(a, dict)]
+
+
+def _activities_get_params(
+    offset: int = 0,
+    limit: int = _ACTIVITIES_PAGE_LIMIT,
+) -> dict[str, Any]:
+    return {"pagination": {"offset": max(0, int(offset)), "limit": max(1, int(limit))}}
+
+
+def _activity_id(activity: dict[str, Any]) -> int | None:
+    try:
+        return int(activity.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _activity_name(activity: dict[str, Any]) -> str:
+    metadata = activity.get("metadata")
+    if isinstance(metadata, dict):
+        name = str(metadata.get("name") or "").strip()
+        if name:
+            return name
+    typ = str(activity.get("type") or "").strip()
+    aid = _activity_id(activity)
+    if typ and aid is not None:
+        return f"{typ} #{aid}"
+    return typ or (f"activity #{aid}" if aid is not None else "activity")
+
+
+def _activity_claimable_board_reward(activity: dict[str, Any]) -> bool:
+    if _json_bool_or_none(activity.get("isClaimed")) is True:
+        return False
+    if str(activity.get("type") or "") != "task_gamee_collect_currency":
+        return False
+    return _activity_id(activity) is not None
+
+
+def _format_activity_claim_rewards(
+    claim_result: dict[str, Any] | None,
+    source_activity: dict[str, Any],
+    divisor: int,
+) -> str:
+    if isinstance(claim_result, dict):
+        rewards_text = _format_activity_rewards_blob(
+            claim_result.get("rewards"),
+            divisor,
+        )
+        if rewards_text != "—":
+            return rewards_text
+        activities = _activities_from_result(claim_result)
+        if activities:
+            rewards_text = _format_activity_rewards_blob(
+                activities[0].get("rewards"),
+                divisor,
+            )
+            if rewards_text != "—":
+                return rewards_text
+    return _format_activity_rewards_blob(source_activity.get("rewards"), divisor)
+
+
 def _json_bool_or_none(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -740,6 +835,13 @@ class PlayOutcome:
     dice_value: int | None = None
     xp_gained: int = 0
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ActivityRewardClaim:
+    activity_id: int
+    name: str
+    rewards_text: str
 
 
 @dataclass
@@ -1578,6 +1680,119 @@ class GameeClient:
         except KeyError:
             pass
         return True, rewards_text, snap
+
+    def get_activities(
+        self, session: GameeSession, *, _relogin: bool = False
+    ) -> list[dict[str, Any]]:
+        self.ensure_session(session)
+        rows = self._post_batch(
+            session,
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "user.getActivities",
+                    "method": "user.getActivities",
+                    "params": _activities_get_params(),
+                }
+            ],
+        )
+        row = self._by_id(rows, "user.getActivities")
+        if "error" in row:
+            err = row["error"]
+            if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                self._force_relogin(session)
+                return self.get_activities(session, _relogin=True)
+            raise RuntimeError(_jsonrpc_error_message(err))
+        result = row.get("result")
+        if not isinstance(result, dict):
+            return []
+        return _activities_from_result(result)
+
+    def claim_board_activity_rewards(
+        self, session: GameeSession, *, _relogin: bool = False
+    ) -> list[ActivityRewardClaim]:
+        self.ensure_session(session)
+        activities = self.get_activities(session)
+        claimed: list[ActivityRewardClaim] = []
+        attempted_ids: set[int] = set()
+        div = self._cfg.reward_micro_divisor
+
+        for _ in range(12):
+            activity: dict[str, Any] | None = None
+            activity_id: int | None = None
+            for item in activities:
+                aid = _activity_id(item)
+                if aid is None or aid in attempted_ids:
+                    continue
+                if _activity_claimable_board_reward(item):
+                    activity = item
+                    activity_id = aid
+                    break
+            if activity is None or activity_id is None:
+                break
+
+            attempted_ids.add(activity_id)
+            batch = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "user.claimActivity",
+                    "method": "user.claimActivity",
+                    "params": {"activityId": activity_id},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": "user.getActivities",
+                    "method": "user.getActivities",
+                    "params": _activities_get_params(),
+                },
+            ]
+            rows = self._post_batch(session, batch)
+            claim_row = self._by_id(rows, "user.claimActivity")
+            if "error" in claim_row:
+                err = claim_row["error"]
+                if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                    self._force_relogin(session)
+                    return self.claim_board_activity_rewards(session, _relogin=True)
+                msg = _jsonrpc_error_message(err)
+                low = msg.lower()
+                if "already" not in low or "claim" not in low:
+                    if claimed:
+                        return claimed
+                    raise RuntimeError(msg)
+            else:
+                claim_res = claim_row.get("result")
+                claim_dict = claim_res if isinstance(claim_res, dict) else None
+                claimed.append(
+                    ActivityRewardClaim(
+                        activity_id=activity_id,
+                        name=_activity_name(activity),
+                        rewards_text=_format_activity_claim_rewards(
+                            claim_dict,
+                            activity,
+                            div,
+                        ),
+                    )
+                )
+                self._assets_cache = None
+
+            refreshed = False
+            try:
+                activities_row = self._by_id(rows, "user.getActivities")
+                if "error" not in activities_row:
+                    result = activities_row.get("result")
+                    if isinstance(result, dict):
+                        activities = _activities_from_result(result)
+                        refreshed = True
+            except Exception:
+                refreshed = False
+            if not refreshed:
+                activities = [
+                    item
+                    for item in activities
+                    if _activity_id(item) != activity_id
+                ]
+
+        return claimed
 
     def get_season_pass_progress(
         self, session: GameeSession, *, _relogin: bool = False
