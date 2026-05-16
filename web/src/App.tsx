@@ -11,6 +11,7 @@ import {
   Search,
   Square,
   Sun,
+  Trophy,
   Trash2,
   Wifi,
   WifiOff
@@ -19,6 +20,7 @@ import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   accountAction,
   deleteAccount,
+  enterDrawAll,
   getState,
   startWorker,
   stopWorker,
@@ -36,7 +38,8 @@ const emptyWorker: WorkerStatus = {
   account_count: 0,
   active_count: 0,
   manual_busy: false,
-  code_busy: false
+  code_busy: false,
+  draw_busy: false
 };
 
 type ThemeMode = "light" | "dark";
@@ -77,6 +80,7 @@ function formatCountdown(iso: string | null | undefined, nowMs: number): string 
 }
 
 function phaseLabel(worker: WorkerStatus): string {
+  if (worker.draw_busy) return "Draw XP выполняется";
   if (worker.stopping) return "останавливается";
   if (!worker.running) return "остановлено";
   if (worker.phase === "fast_bootstrap") return "быстрый первый проход";
@@ -229,6 +233,9 @@ function AccountDrawer({
           </button>
           <button disabled={busy || pending} className="action-btn" onClick={() => run(() => accountAction(row.label, "play-session"))}>
             <Dice5 size={16} /> Play session
+          </button>
+          <button disabled={busy || pending} className="action-btn" onClick={() => run(() => accountAction(row.label, "enter-draw"))}>
+            <Trophy size={16} /> Draw XP
           </button>
         </div>
 
@@ -394,6 +401,8 @@ export default function App() {
     }
   };
 
+  const topBusy = worker.running || worker.manual_busy || worker.code_busy || !!worker.draw_busy;
+
   return (
     <div className="min-h-screen bg-panel text-slate-900">
       <header className="border-b border-line bg-white">
@@ -421,10 +430,18 @@ export default function App() {
               </button>
               <button
                 className="top-btn bg-emerald-700 text-white hover:bg-emerald-800"
-                disabled={worker.running || worker.manual_busy || worker.code_busy}
+                disabled={topBusy}
                 onClick={() => runTopAction(startWorker)}
               >
                 <Play size={16} /> Запустить всё
+              </button>
+              <button
+                className="top-btn bg-cyan-700 text-white hover:bg-cyan-800"
+                disabled={topBusy}
+                onClick={() => runTopAction(enterDrawAll)}
+              >
+                {worker.draw_busy ? <Loader2 className="animate-spin" size={16} /> : <Trophy size={16} />}
+                Draw XP
               </button>
               <button
                 className="top-btn bg-slate-800 text-white hover:bg-slate-950"
@@ -576,7 +593,7 @@ export default function App() {
             </div>
             <button
               className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-md bg-slate-800 px-3 py-2 text-sm font-semibold text-white hover:bg-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={!massCode.trim() || worker.running || worker.manual_busy || worker.code_busy}
+              disabled={!massCode.trim() || topBusy}
               onClick={submitCode}
             >
               {worker.code_busy ? <Loader2 className="animate-spin" size={16} /> : <Gift size={16} />} Отправить код
@@ -587,7 +604,7 @@ export default function App() {
 
       <AccountDrawer
         row={selectedRow}
-        busy={worker.running || worker.manual_busy || worker.code_busy}
+        busy={topBusy}
         onClose={() => setSelected(null)}
         onToast={showToast}
         onDeleted={() => setSelected(null)}

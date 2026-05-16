@@ -45,6 +45,7 @@ from gamee_bot.ui.app_style import apply_app_style
 from gamee_bot.ui.edit_proxy_dialog import EditAccountProxyDialog
 from gamee_bot.ui.enter_code_dialog import EnterCodeDialog
 from gamee_bot.ui.enter_code_thread import EnterCodeThread
+from gamee_bot.ui.enter_draw_thread import EnterDrawThread
 from gamee_bot.ui.settings_dialog import SettingsDialog
 from gamee_bot.regen import format_daily_checkin_countdown, format_next_live_countdown
 from gamee_bot.gamee_transport import (
@@ -67,6 +68,7 @@ class MainWindow(QMainWindow):
         self._logged_cfg_error_once = False
         self._telethon_ready = False
         self._enter_code_thread: EnterCodeThread | None = None
+        self._enter_draw_thread: EnterDrawThread | None = None
         self._manual_action_thread: AccountActionThread | None = None
         self._known_account_labels: set[str] = set()
         self._session_gold_earned: defaultdict[str, int] = defaultdict(int)
@@ -141,12 +143,14 @@ class MainWindow(QMainWindow):
     def _sync_bot_buttons(self) -> None:
         manual_busy = self._manual_action_thread is not None and self._manual_action_thread.isRunning()
         code_busy = self._enter_code_thread is not None and self._enter_code_thread.isRunning()
+        draw_busy = self._enter_draw_thread is not None and self._enter_draw_thread.isRunning()
         running = self._worker is not None and self._worker.isRunning()
-        self._btn_start_bot.setEnabled(not running and not manual_busy and not code_busy)
+        self._btn_start_bot.setEnabled(not running and not manual_busy and not code_busy and not draw_busy)
         self._btn_stop_bot.setEnabled(running)
-        self._btn_enter_code.setEnabled(not manual_busy and not code_busy)
+        self._btn_enter_code.setEnabled(not manual_busy and not code_busy and not draw_busy)
+        self._btn_enter_draw.setEnabled(not running and not manual_busy and not code_busy and not draw_busy)
         sel = self._selected_account_label() is not None
-        manual_enabled = sel and not running and not manual_busy and not code_busy
+        manual_enabled = sel and not running and not manual_busy and not code_busy and not draw_busy
         self._btn_sync_now.setEnabled(manual_enabled)
         self._btn_claim_daily.setEnabled(manual_enabled)
         self._btn_play_session.setEnabled(manual_enabled)
@@ -154,12 +158,13 @@ class MainWindow(QMainWindow):
     def _update_worker_status_label(self) -> None:
         running = self._worker is not None and self._worker.isRunning()
         manual_busy = self._manual_action_thread is not None and self._manual_action_thread.isRunning()
+        draw_busy = self._enter_draw_thread is not None and self._enter_draw_thread.isRunning()
         mode = background_mode_label(
             self._cfg.compliance.background_mode if self._cfg is not None else BACKGROUND_MODE_MANUAL_ONLY
         )
-        if manual_busy and not running:
+        if (manual_busy or draw_busy) and not running:
             self._worker_status.setText("● Выполняется ручное действие")
-            self._worker_status.setToolTip("Идёт явная user-triggered операция по выбранному аккаунту.")
+            self._worker_status.setToolTip("Идёт явная user-triggered операция.")
             self._worker_status.setObjectName("workerStatusRunning")
         elif running:
             self._worker_status.setText(f"● Фон запущен · {mode}")
@@ -265,6 +270,9 @@ class MainWindow(QMainWindow):
         if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
             QMessageBox.information(self, "Код", "Дождитесь завершения текущего ручного действия.")
             return
+        if self._enter_draw_thread is not None and self._enter_draw_thread.isRunning():
+            QMessageBox.information(self, "Код", "Дождитесь завершения Draw XP.")
+            return
         if not self._telethon_ready:
             QMessageBox.warning(self, "Telegram API", TELETHON_CREDENTIALS_REQUIRED_MSG)
             return
@@ -317,6 +325,61 @@ class MainWindow(QMainWindow):
             self._enter_code_thread = None
         self._sync_bot_buttons()
 
+    def _on_enter_draw_all(self) -> None:
+        self._load_config_silent()
+        if self._cfg is None or self._config_error:
+            QMessageBox.critical(self, "Конфиг", self._config_error or "Нет конфига")
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Draw XP", "Остановите фоновый режим перед добавлением XP в draw.")
+            return
+        if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
+            QMessageBox.information(self, "Draw XP", "Дождитесь завершения текущего ручного действия.")
+            return
+        if self._enter_code_thread is not None and self._enter_code_thread.isRunning():
+            QMessageBox.information(self, "Draw XP", "Дождитесь завершения массового промокода.")
+            return
+        if self._enter_draw_thread is not None and self._enter_draw_thread.isRunning():
+            QMessageBox.information(self, "Draw XP", "Draw XP уже выполняется.")
+            return
+        if not self._telethon_ready:
+            QMessageBox.warning(self, "Telegram API", TELETHON_CREDENTIALS_REQUIRED_MSG)
+            return
+        if not self._ensure_transport_backend_ready("Draw XP"):
+            return
+        try:
+            accounts = load_accounts(self._cfg.accounts_path)
+        except Exception as e:
+            QMessageBox.critical(self, "accounts.yaml", str(e))
+            return
+        if not accounts:
+            QMessageBox.information(self, "Draw XP", "Нет аккаунтов в accounts.yaml.")
+            return
+        ans = QMessageBox.question(
+            self,
+            "Draw XP",
+            f"Добавить доступный XP в Lucky Draw для {len(accounts)} аккаунтов?\n\n"
+            "Будут пропущены locked/purchase-only draw и аккаунты, где нечего добавить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._log.append("——— Draw XP для всех аккаунтов ———")
+        th = EnterDrawThread(self._cfg, self)
+        self._enter_draw_thread = th
+        th.log_line.connect(self._log.append)
+        th.finished.connect(self._on_enter_draw_thread_finished)
+        self._sync_bot_buttons()
+        self._update_worker_status_label()
+        th.start()
+
+    def _on_enter_draw_thread_finished(self) -> None:
+        if self.sender() is self._enter_draw_thread:
+            self._enter_draw_thread = None
+        self._sync_bot_buttons()
+        self._update_worker_status_label()
+
     def _rows_for_display(self) -> list[dict[str, Any]]:
         merged = {k: dict(v) for k, v in self._last_rows_by_label.items()}
         try:
@@ -367,6 +430,9 @@ class MainWindow(QMainWindow):
         if self._enter_code_thread is not None and self._enter_code_thread.isRunning():
             QMessageBox.information(self, "Ручное действие", "Дождитесь завершения массового промокода.")
             return
+        if self._enter_draw_thread is not None and self._enter_draw_thread.isRunning():
+            QMessageBox.information(self, "Ручное действие", "Дождитесь завершения Draw XP.")
+            return
         if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
             QMessageBox.information(self, "Ручное действие", "Уже выполняется другое ручное действие.")
             return
@@ -409,6 +475,7 @@ class MainWindow(QMainWindow):
         names = {
             "sync": "Sync now",
             "claim_daily": "Claim daily",
+            "enter_draw": "Draw XP",
             "play_session": "Play session",
         }
         self._log.append(f"[{label}] {names.get(action, action)} — старт.")
@@ -487,6 +554,12 @@ class MainWindow(QMainWindow):
         )
         self._btn_enter_code.clicked.connect(self._on_enter_code)
         bar.addWidget(self._btn_enter_code)
+        self._btn_enter_draw = QPushButton("Draw XP")
+        self._btn_enter_draw.setToolTip(
+            "Добавляет доступный XP аккаунтов в подходящую Lucky Draw раздачу вручную."
+        )
+        self._btn_enter_draw.clicked.connect(self._on_enter_draw_all)
+        bar.addWidget(self._btn_enter_draw)
         bar.addStretch()
         self._btn_delete = QPushButton("Удалить выбранный…")
         self._btn_delete.setObjectName("btnStop")
@@ -647,6 +720,12 @@ class MainWindow(QMainWindow):
             return
         if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
             QMessageBox.information(self, "Фон", "Дождитесь завершения текущего ручного действия.")
+            return
+        if self._enter_code_thread is not None and self._enter_code_thread.isRunning():
+            QMessageBox.information(self, "Фон", "Дождитесь завершения массового промокода.")
+            return
+        if self._enter_draw_thread is not None and self._enter_draw_thread.isRunning():
+            QMessageBox.information(self, "Фон", "Дождитесь завершения Draw XP.")
             return
         if not self._ensure_transport_backend_ready("Фон"):
             return
@@ -1167,6 +1246,8 @@ class MainWindow(QMainWindow):
         self._wait_thread_finish(self._manual_action_thread, 30_000)
         self._manual_action_thread = None
         self._wait_thread_finish(self._enter_code_thread, 30_000)
+        self._wait_thread_finish(self._enter_draw_thread, 30_000)
+        self._enter_draw_thread = None
         super().closeEvent(event)
 
 

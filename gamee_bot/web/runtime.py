@@ -21,6 +21,7 @@ from gamee_bot.gamee_transport import gamee_transport_backend_blocker_message
 from gamee_bot.telethon_bridge import clear_init_cache
 from gamee_bot.ui.account_action_thread import AccountActionThread
 from gamee_bot.ui.enter_code_thread import EnterCodeThread
+from gamee_bot.ui.enter_draw_thread import EnterDrawThread
 from gamee_bot.web.state import AppStateStore
 from gamee_bot.worker import BotWorker
 
@@ -34,6 +35,7 @@ class WebRuntime:
         self._worker: BotWorker | None = None
         self._manual_thread: AccountActionThread | None = None
         self._code_thread: EnterCodeThread | None = None
+        self._draw_thread: EnterDrawThread | None = None
         self._manual_moves_used_today: dict[str, tuple[str, int]] = {}
 
     def load(self) -> AppConfig:
@@ -43,6 +45,11 @@ class WebRuntime:
         self._store.load_placeholders(cfg)
         self._refresh_busy_flags()
         return cfg
+
+    def refresh_status(self) -> None:
+        with self._lock:
+            self._cleanup_finished_threads_locked()
+            self._refresh_busy_flags()
 
     def _cfg_ready(self) -> AppConfig:
         cfg = load_config(self._config_path)
@@ -59,12 +66,24 @@ class WebRuntime:
 
     def start_worker(self) -> dict[str, Any]:
         with self._lock:
+            self._cleanup_finished_threads_locked()
+            self._refresh_busy_flags()
             if self._worker is not None and self._worker.isRunning():
                 return {"ok": True, "message": "Фон уже запущен"}
             if self._manual_thread is not None and self._manual_thread.isRunning():
                 raise HTTPException(
                     status_code=409,
                     detail="Дождитесь завершения ручного действия.",
+                )
+            if self._code_thread is not None and self._code_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения массового промокода.",
+                )
+            if self._draw_thread is not None and self._draw_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения Draw XP.",
                 )
             cfg = self._cfg_ready()
             self._ensure_can_use_transport(cfg)
@@ -124,9 +143,11 @@ class WebRuntime:
         action = str(action or "").strip()
         if not label:
             raise HTTPException(status_code=400, detail="Пустой label.")
-        if action not in {"sync", "claim_daily", "play_session"}:
+        if action not in {"sync", "claim_daily", "play_session", "enter_draw"}:
             raise HTTPException(status_code=400, detail="Неизвестное действие.")
         with self._lock:
+            self._cleanup_finished_threads_locked()
+            self._refresh_busy_flags()
             if self._worker is not None and self._worker.isRunning():
                 raise HTTPException(
                     status_code=409,
@@ -136,6 +157,16 @@ class WebRuntime:
                 raise HTTPException(
                     status_code=409,
                     detail="Уже выполняется другое ручное действие.",
+                )
+            if self._code_thread is not None and self._code_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения массового промокода.",
+                )
+            if self._draw_thread is not None and self._draw_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения Draw XP.",
                 )
             cfg = self._cfg_ready()
             self._ensure_can_use_transport(cfg)
@@ -213,6 +244,8 @@ class WebRuntime:
         if not code:
             raise HTTPException(status_code=400, detail="Код пустой.")
         with self._lock:
+            self._cleanup_finished_threads_locked()
+            self._refresh_busy_flags()
             if self._worker is not None and self._worker.isRunning():
                 raise HTTPException(
                     status_code=409,
@@ -222,6 +255,16 @@ class WebRuntime:
                 raise HTTPException(
                     status_code=409,
                     detail="Промокод уже отправляется.",
+                )
+            if self._manual_thread is not None and self._manual_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения ручного действия.",
+                )
+            if self._draw_thread is not None and self._draw_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения Draw XP.",
                 )
             cfg = self._cfg_ready()
             self._ensure_can_use_transport(cfg)
@@ -241,6 +284,40 @@ class WebRuntime:
             thread.start()
             return {"ok": True, "message": "Промокод отправляется"}
 
+    def enter_draw_all(self) -> dict[str, Any]:
+        with self._lock:
+            self._cleanup_finished_threads_locked()
+            self._refresh_busy_flags()
+            if self._worker is not None and self._worker.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Сначала остановите фоновый режим.",
+                )
+            if self._manual_thread is not None and self._manual_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения ручного действия.",
+                )
+            if self._code_thread is not None and self._code_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения массового промокода.",
+                )
+            if self._draw_thread is not None and self._draw_thread.isRunning():
+                raise HTTPException(status_code=409, detail="Draw XP уже выполняется.")
+            cfg = self._cfg_ready()
+            self._ensure_can_use_transport(cfg)
+            thread = EnterDrawThread(cfg)
+            thread.log_line.connect(self._on_log, Qt.ConnectionType.DirectConnection)
+            thread.finished.connect(
+                self._on_draw_finished, Qt.ConnectionType.DirectConnection
+            )
+            self._draw_thread = thread
+            self._store.set_worker_status(draw_busy=True, phase="draw_xp")
+            self._store.add_log("Draw XP для всех аккаунтов — старт.")
+            thread.start()
+            return {"ok": True, "message": "Draw XP запущен"}
+
     def _on_worker_rows(self, rows: object) -> None:
         if isinstance(rows, list):
             self._store.update_rows([dict(r) for r in rows if isinstance(r, dict)])
@@ -250,7 +327,10 @@ class WebRuntime:
             self._store.upsert_row(dict(row))
 
     def _on_log(self, message: str) -> None:
-        self._store.add_log(str(message or ""))
+        text = str(message or "")
+        self._store.add_log(text)
+        if self._is_draw_done_log(text):
+            self._mark_draw_finished()
 
     def _on_fatal(self, message: str) -> None:
         self._store.add_log("КРИТИЧНО: " + str(message or ""), kind="fatal")
@@ -287,12 +367,59 @@ class WebRuntime:
             self._code_thread = None
             self._store.set_worker_status(code_busy=False)
 
+    def _on_draw_finished(self) -> None:
+        self._mark_draw_finished()
+
     def _refresh_busy_flags(self) -> None:
-        self._store.set_worker_status(
-            running=self._worker is not None and self._worker.isRunning(),
-            manual_busy=self._manual_thread is not None and self._manual_thread.isRunning(),
-            code_busy=self._code_thread is not None and self._code_thread.isRunning(),
-        )
+        running = self._thread_is_running(self._worker)
+        draw_busy = self._thread_is_running(self._draw_thread)
+        patch: dict[str, Any] = {
+            "running": running,
+            "manual_busy": self._thread_is_running(self._manual_thread),
+            "code_busy": self._thread_is_running(self._code_thread),
+            "draw_busy": draw_busy,
+        }
+        if draw_busy:
+            patch["phase"] = "draw_xp"
+        elif not running:
+            patch["phase"] = "stopped"
+        self._store.set_worker_status(**patch)
+
+    def _cleanup_finished_threads_locked(self) -> None:
+        if self._worker is not None and not self._thread_is_running(self._worker):
+            self._worker = None
+        if self._manual_thread is not None and not self._thread_is_running(
+            self._manual_thread
+        ):
+            self._manual_thread = None
+        if self._code_thread is not None and not self._thread_is_running(
+            self._code_thread
+        ):
+            self._code_thread = None
+        if self._draw_thread is not None and not self._thread_is_running(
+            self._draw_thread
+        ):
+            self._draw_thread = None
+
+    def _mark_draw_finished(self) -> None:
+        with self._lock:
+            self._draw_thread = None
+            phase = "steady" if self._thread_is_running(self._worker) else "stopped"
+            self._store.set_worker_status(draw_busy=False, phase=phase)
+
+    @staticmethod
+    def _is_draw_done_log(message: str) -> bool:
+        text = str(message or "").strip().casefold()
+        return text.startswith("draw xp:") and "готово" in text
+
+    @staticmethod
+    def _thread_is_running(thread: object | None) -> bool:
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())  # type: ignore[attr-defined]
+        except RuntimeError:
+            return False
 
     @staticmethod
     def _day_key_local() -> str:

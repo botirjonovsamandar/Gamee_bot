@@ -9,6 +9,7 @@ export type WorkerStatus = {
   active_count: number;
   manual_busy: boolean;
   code_busy: boolean;
+  draw_busy?: boolean;
 };
 
 export type SessionEarned = {
@@ -76,4 +77,3 @@ export type WsEvent =
   | { type: "earnings.updated"; seq: number; payload: { label: string; session_earned: SessionEarned } }
   | { type: "config.updated"; seq: number; payload: { config: UiConfig } }
   | { type: string; seq: number; payload: Record<string, unknown> };
-

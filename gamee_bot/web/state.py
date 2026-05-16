@@ -59,6 +59,7 @@ class AppStateStore:
             "active_count": 0,
             "manual_busy": False,
             "code_busy": False,
+            "draw_busy": False,
         }
         self._ui_config: dict[str, Any] = {}
         self._seq = 0

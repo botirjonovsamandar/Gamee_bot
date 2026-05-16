@@ -12,6 +12,14 @@ from gamee_bot.proxy_url import normalize_and_validate_gamee_proxy
 from gamee_bot.worker import build_gamee_session_for_account, play_energy_threshold_for_label
 
 
+def _format_micro_amount(amount_micro: int, divisor: int) -> str:
+    div = divisor if divisor > 0 else 1_000_000
+    value = int(amount_micro) / float(div)
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
 class AccountActionThread(QThread):
     """Ручные действия по одному аккаунту: sync, daily claim, limited play session."""
 
@@ -122,6 +130,42 @@ class AccountActionThread(QThread):
                 else:
                     self.log_line.emit(f"[{acc.label}] Ежедневная награда не взята: {msg}")
                     self._emit_row(client, session, acc, state)
+                return
+
+            if self._action == "enter_draw":
+                res = client.enter_lucky_draw_with_available_xp(session)
+                state = client.get_assets_state(session)
+                if res.entered:
+                    amount = _format_micro_amount(
+                        res.entered_micro,
+                        self._cfg.gamee.reward_micro_divisor,
+                    )
+                    title = res.title or f"draw #{res.draw_id}"
+                    action_text = (
+                        f"добавлено {amount} XP"
+                        if res.already_entered
+                        else f"начато участие: внесено {amount} XP"
+                    )
+                    self.log_line.emit(
+                        f"[{acc.label}] Draw XP: {action_text} в {title} (drawId={res.draw_id})."
+                    )
+                    self._emit_row(
+                        client,
+                        session,
+                        acc,
+                        state,
+                        status_override="draw XP добавлен",
+                    )
+                else:
+                    reason = res.reason or "нет доступной XP-раздачи"
+                    self.log_line.emit(f"[{acc.label}] Draw XP: {reason}.")
+                    self._emit_row(
+                        client,
+                        session,
+                        acc,
+                        state,
+                        status_override="draw XP: нечего добавить",
+                    )
                 return
 
             if self._action != "play_session":

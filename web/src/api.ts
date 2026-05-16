@@ -32,7 +32,7 @@ export function stopWorker(): Promise<{ ok: boolean; message: string }> {
 
 export function accountAction(
   label: string,
-  action: "sync" | "claim-daily" | "play-session"
+  action: "sync" | "claim-daily" | "play-session" | "enter-draw"
 ): Promise<{ ok: boolean; message: string }> {
   return request(`/api/accounts/${encodeURIComponent(label)}/${action}`, {
     method: "POST"
@@ -65,3 +65,6 @@ export function submitMassCode(
   });
 }
 
+export function enterDrawAll(): Promise<{ ok: boolean; message: string }> {
+  return request("/api/draw/enter-all", { method: "POST" });
+}

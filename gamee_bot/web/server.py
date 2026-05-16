@@ -79,6 +79,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/state")
     async def api_state() -> dict[str, Any]:
+        runtime.refresh_status()
         return store.snapshot()
 
     @app.post("/api/worker/start")
@@ -101,6 +102,10 @@ def create_app() -> FastAPI:
     async def api_account_play_session(label: str) -> dict[str, Any]:
         return runtime.run_account_action(label, "play_session")
 
+    @app.post("/api/accounts/{label}/enter-draw")
+    async def api_account_enter_draw(label: str) -> dict[str, Any]:
+        return runtime.run_account_action(label, "enter_draw")
+
     @app.post("/api/accounts/{label}/proxy")
     async def api_account_proxy(
         label: str, body: ProxyUpdateRequest
@@ -115,10 +120,15 @@ def create_app() -> FastAPI:
     async def api_mass_code(body: MassCodeRequest) -> dict[str, Any]:
         return runtime.submit_mass_code(body.code, body.task_id)
 
+    @app.post("/api/draw/enter-all")
+    async def api_draw_enter_all() -> dict[str, Any]:
+        return runtime.enter_draw_all()
+
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:
         await hub.connect(ws)
         try:
+            runtime.refresh_status()
             await ws.send_json(store.snapshot_event())
             while True:
                 await ws.receive_text()
@@ -152,4 +162,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

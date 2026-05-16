@@ -42,10 +42,14 @@ _BATCH_NOISE_METHODS = [
 # Methods that must NOT have their batch shuffled or padded (order-sensitive).
 _BATCH_NO_RANDOMIZE_IDS = frozenset({
     "user.authentication.loginUsingTelegram",
+    "draw.enter",
+    "draw.getAll",
     "user.claimActivity",
     "user.getActivities",
 })
 _ACTIVITIES_PAGE_LIMIT = 25
+_DRAW_PAGE_LIMIT = 100
+_XP_CURRENCY_ID = 66
 
 
 class GameeTransientServerError(RuntimeError):
@@ -572,6 +576,278 @@ def _format_activity_claim_rewards(
     return _format_activity_rewards_blob(source_activity.get("rewards"), divisor)
 
 
+def _draw_get_params(offset: int = 0, limit: int = _DRAW_PAGE_LIMIT) -> dict[str, Any]:
+    return {"pagination": {"offset": max(0, int(offset)), "limit": max(1, int(limit))}}
+
+
+def _normalize_draw(raw: dict[str, Any]) -> dict[str, Any]:
+    nested = raw.get("draw")
+    if isinstance(nested, dict):
+        merged = dict(raw)
+        merged.update(nested)
+        return merged
+    return raw
+
+
+def _draws_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("luckyDraws", "draws", "items", "data"):
+        raw = result.get(key)
+        if isinstance(raw, list):
+            return [_normalize_draw(d) for d in raw if isinstance(d, dict)]
+        if isinstance(raw, dict):
+            nested = raw.get("items")
+            if isinstance(nested, list):
+                return [_normalize_draw(d) for d in nested if isinstance(d, dict)]
+    return []
+
+
+def _to_int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _virtual_token_micro(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    for key in ("amountMicroToken", "amount", "microAmount"):
+        amount = _to_int_or_zero(value.get(key))
+        if amount > 0:
+            return amount
+    return 0
+
+
+def _virtual_token_ticker(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    cur = value.get("currency")
+    if not isinstance(cur, dict):
+        return ""
+    return str(cur.get("ticker") or "").upper()
+
+
+def _virtual_token_currency_id(value: Any) -> int:
+    if not isinstance(value, dict):
+        return -1
+    cur = value.get("currency")
+    if not isinstance(cur, dict):
+        return -1
+    return _to_int_or_zero(cur.get("id"))
+
+
+def _draw_entry_fee_micro(draw: dict[str, Any]) -> int:
+    fee = draw.get("entryFeeVirtualToken")
+    amount = _virtual_token_micro(fee)
+    if amount > 0:
+        return amount
+    for key in ("entryFeeMicroToken", "entryFeeAmountMicroToken"):
+        amount = _to_int_or_zero(draw.get(key))
+        if amount > 0:
+            return amount
+    return 0
+
+
+def _draw_entry_is_xp(draw: dict[str, Any]) -> bool:
+    fee = draw.get("entryFeeVirtualToken")
+    ticker = _virtual_token_ticker(fee)
+    if ticker:
+        return ticker == "TGXP"
+    cid = _virtual_token_currency_id(fee)
+    return cid == _XP_CURRENCY_ID
+
+
+def _draw_title(draw: dict[str, Any]) -> str:
+    for key in ("name", "title", "label"):
+        value = str(draw.get(key) or "").strip()
+        if value:
+            return value
+    did = _to_int_or_zero(draw.get("id"))
+    return f"draw #{did}" if did > 0 else "draw"
+
+
+def _draw_has_blocking_flag(draw: dict[str, Any]) -> bool:
+    blocking_true = (
+        "isLocked",
+        "locked",
+        "premiumOnly",
+        "isPremiumOnly",
+        "premiumUsersOnly",
+        "forPremiumUsersOnly",
+        "requiresPremium",
+        "premiumRequired",
+        "requiresPurchase",
+        "purchaseRequired",
+        "isPurchaseRequired",
+        "requiresPayment",
+        "paymentRequired",
+    )
+    for key in blocking_true:
+        if _json_bool_or_none(draw.get(key)) is True:
+            return True
+    availability_false = (
+        "canEnter",
+        "enterAvailable",
+        "isEnterable",
+        "isAvailable",
+        "isUnlocked",
+    )
+    for key in availability_false:
+        value = _json_bool_or_none(draw.get(key))
+        if value is False:
+            return True
+    for key in ("unlockType", "unlockCondition", "entryCondition", "eligibility"):
+        value = str(draw.get(key) or "").lower()
+        if any(x in value for x in ("premium", "purchase", "shop", "ton", "star")):
+            return True
+    return False
+
+
+def _draw_is_open(draw: dict[str, Any]) -> bool:
+    for key in ("isFinished", "finished", "isClosed", "closed", "isExpired"):
+        if _json_bool_or_none(draw.get(key)) is True:
+            return False
+    status = str(draw.get("status") or draw.get("state") or "").strip().lower()
+    if status in {"finished", "closed", "ended", "expired", "cancelled", "drawn"}:
+        return False
+    return True
+
+
+def _draw_direct_micro(draw: dict[str, Any], keys: tuple[str, ...]) -> int:
+    for key in keys:
+        amount = _to_int_or_zero(draw.get(key))
+        if amount > 0:
+            return amount
+    return 0
+
+
+def _draw_user_entered_micro(draw: dict[str, Any]) -> int:
+    amount = _draw_direct_micro(
+        draw,
+        (
+            "userEnteredAmountMicroToken",
+            "userEnterAmountMicroToken",
+            "enteredAmountMicroToken",
+            "myEntryAmountMicroToken",
+            "myInputAmountMicroToken",
+            "participationAmountMicroToken",
+        ),
+    )
+    if amount > 0:
+        return amount
+    for key in (
+        "userEntry",
+        "myEntry",
+        "currentUserEntry",
+        "myInputVirtualToken",
+        "userParticipation",
+        "participation",
+    ):
+        nested = draw.get(key)
+        if isinstance(nested, dict):
+            amount = _virtual_token_micro(nested)
+            if amount > 0:
+                return amount
+            for nested_key in ("amountMicroToken", "enterAmountMicroToken"):
+                amount = _to_int_or_zero(nested.get(nested_key))
+                if amount > 0:
+                    return amount
+    return 0
+
+
+def _draw_available_enter_micro(draw: dict[str, Any]) -> int:
+    return _draw_direct_micro(
+        draw,
+        (
+            "availableEnterAmountMicroToken",
+            "enterAvailableAmountMicroToken",
+            "unenteredAmountMicroToken",
+            "availableAmountMicroToken",
+        ),
+    )
+
+
+def _draw_candidate_enter_amount(draw: dict[str, Any], xp_micro: int) -> int:
+    if xp_micro <= 0:
+        return 0
+    available = _draw_available_enter_micro(draw)
+    if available > 0:
+        return min(xp_micro, available)
+    entered = _draw_user_entered_micro(draw)
+    if entered > 0:
+        return xp_micro
+    fee = _draw_entry_fee_micro(draw)
+    if fee > 0 and xp_micro >= fee:
+        return fee
+    return 0
+
+
+def _draw_is_supported_xp_draw(draw: dict[str, Any]) -> bool:
+    if _to_int_or_zero(draw.get("id")) <= 0:
+        return False
+    if not _draw_is_open(draw) or _draw_has_blocking_flag(draw):
+        return False
+    if not _draw_entry_is_xp(draw):
+        return False
+    return _draw_entry_fee_micro(draw) > 1_000_000
+
+
+def _select_draw_for_xp_enter(
+    draws: list[dict[str, Any]], xp_micro: int
+) -> tuple[dict[str, Any], int] | None:
+    candidates = _draw_enter_candidates_for_xp(draws, xp_micro)
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _draw_enter_candidates_for_xp(
+    draws: list[dict[str, Any]], xp_micro: int
+) -> list[tuple[dict[str, Any], int]]:
+    candidates: list[tuple[int, int, dict[str, Any], int]] = []
+    for draw in draws:
+        if not _draw_is_supported_xp_draw(draw):
+            continue
+        amount = _draw_candidate_enter_amount(draw, xp_micro)
+        if amount <= 0:
+            continue
+        already_entered = _draw_user_entered_micro(draw)
+        fee = _draw_entry_fee_micro(draw)
+        priority = 0 if already_entered > 0 else 1
+        sort_value = -already_entered if already_entered > 0 else fee
+        candidates.append((priority, sort_value, draw, amount))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [(draw, amount) for _, _, draw, amount in candidates]
+
+
+def _free_xp_draw_min_entry_fee(draws: list[dict[str, Any]]) -> int:
+    fees: list[int] = []
+    for draw in draws:
+        if not _draw_is_supported_xp_draw(draw):
+            continue
+        fee = _draw_entry_fee_micro(draw)
+        if fee > 0:
+            fees.append(fee)
+    return min(fees) if fees else 0
+
+
+def _draw_enter_error_is_skip_candidate(err: Any) -> bool:
+    code = _jsonrpc_error_code(err)
+    msg = _jsonrpc_error_message(err).lower()
+    if code == 1165:
+        return True
+    return any(
+        text in msg
+        for text in (
+            "premium",
+            "purchase",
+            "locked",
+            "not available",
+            "not eligible",
+        )
+    )
+
+
 def _json_bool_or_none(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -842,6 +1118,20 @@ class ActivityRewardClaim:
     activity_id: int
     name: str
     rewards_text: str
+
+
+@dataclass(frozen=True)
+class DrawEnterResult:
+    draw_id: int | None
+    title: str
+    entered_micro: int
+    reason: str = ""
+    already_entered: bool = False
+    existing_micro: int = 0
+
+    @property
+    def entered(self) -> bool:
+        return self.entered_micro > 0 and self.draw_id is not None
 
 
 @dataclass
@@ -1793,6 +2083,149 @@ class GameeClient:
                 ]
 
         return claimed
+
+    def get_wallet_xp_micro(
+        self, session: GameeSession, *, _relogin: bool = False
+    ) -> int:
+        self.ensure_session(session)
+        rows = self._post_batch(
+            session,
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "user.getAssets",
+                    "method": "user.getAssets",
+                    "params": {},
+                }
+            ],
+        )
+        row = self._by_id(rows, "user.getAssets")
+        if "error" in row:
+            err = row["error"]
+            if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                self._force_relogin(session)
+                return self.get_wallet_xp_micro(session, _relogin=True)
+            raise RuntimeError(_jsonrpc_error_message(err))
+        result = row.get("result")
+        if not isinstance(result, dict):
+            return 0
+        batch_user = row.get("user") if isinstance(row.get("user"), dict) else None
+        vt = _wallet_virtual_tokens_merged(result, batch_user)
+        xp = _micro_by_ticker(vt, "TGXP")
+        if xp <= 0:
+            xp = _micro_by_currency_id(vt, _XP_CURRENCY_ID)
+        return xp
+
+    def get_lucky_draws(
+        self, session: GameeSession, *, _relogin: bool = False
+    ) -> list[dict[str, Any]]:
+        self.ensure_session(session)
+        rows = self._post_batch(
+            session,
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "draw.getAll",
+                    "method": "draw.getAll",
+                    "params": _draw_get_params(),
+                }
+            ],
+        )
+        row = self._by_id(rows, "draw.getAll")
+        if "error" in row:
+            err = row["error"]
+            if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                self._force_relogin(session)
+                return self.get_lucky_draws(session, _relogin=True)
+            raise RuntimeError(_jsonrpc_error_message(err))
+        result = row.get("result")
+        if not isinstance(result, dict):
+            return []
+        return _draws_from_result(result)
+
+    def enter_lucky_draw_with_available_xp(
+        self, session: GameeSession, *, _relogin: bool = False
+    ) -> DrawEnterResult:
+        self.ensure_session(session)
+        xp_micro = self.get_wallet_xp_micro(session)
+        if xp_micro <= 0:
+            return DrawEnterResult(None, "", 0, "XP balance is empty")
+        draws = self.get_lucky_draws(session)
+        candidates = _draw_enter_candidates_for_xp(draws, xp_micro)
+        if not candidates:
+            xp_text = _format_reward_amount(xp_micro, self._cfg.reward_micro_divisor)
+            min_fee = _free_xp_draw_min_entry_fee(draws)
+            if min_fee > 0 and xp_micro < min_fee:
+                min_text = _format_reward_amount(
+                    min_fee,
+                    self._cfg.reward_micro_divisor,
+                )
+                missing_text = _format_reward_amount(
+                    min_fee - xp_micro,
+                    self._cfg.reward_micro_divisor,
+                )
+                return DrawEnterResult(
+                    None,
+                    "",
+                    0,
+                    f"not enough XP for first free draw entry: have {xp_text}, need {min_text}, missing {missing_text}",
+                )
+            return DrawEnterResult(
+                None,
+                "",
+                0,
+                f"no free XP draw can accept current balance (XP {xp_text})",
+            )
+
+        skipped: list[str] = []
+        for draw, amount in candidates:
+            draw_id = _to_int_or_zero(draw.get("id"))
+            if draw_id <= 0 or amount <= 0:
+                continue
+            existing_micro = _draw_user_entered_micro(draw)
+            batch = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "draw.enter",
+                    "method": "draw.enter",
+                    "params": {
+                        "drawId": draw_id,
+                        "enterAmountMicroToken": int(amount),
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": "draw.getAll",
+                    "method": "draw.getAll",
+                    "params": _draw_get_params(),
+                },
+            ]
+            rows = self._post_batch(session, batch)
+            enter_row = self._by_id(rows, "draw.enter")
+            if "error" in enter_row:
+                err = enter_row["error"]
+                if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                    self._force_relogin(session)
+                    return self.enter_lucky_draw_with_available_xp(
+                        session, _relogin=True
+                    )
+                if _draw_enter_error_is_skip_candidate(err):
+                    skipped.append(f"{draw_id}: {_jsonrpc_error_message(err)}")
+                    continue
+                raise RuntimeError(_jsonrpc_error_message(err))
+            self._assets_cache = None
+            return DrawEnterResult(
+                draw_id,
+                _draw_title(draw),
+                int(amount),
+                already_entered=existing_micro > 0,
+                existing_micro=existing_micro,
+            )
+
+        reason = "no free XP draw accepted enter request"
+        if skipped:
+            reason += f"; skipped: {'; '.join(skipped[:3])}"
+        return DrawEnterResult(None, "", 0, reason)
 
     def get_season_pass_progress(
         self, session: GameeSession, *, _relogin: bool = False
