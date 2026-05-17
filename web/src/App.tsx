@@ -19,6 +19,7 @@ import {
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   accountAction,
+  checkDrawWinners,
   deleteAccount,
   enterDrawAll,
   getState,
@@ -80,6 +81,7 @@ function formatCountdown(iso: string | null | undefined, nowMs: number): string 
 }
 
 function phaseLabel(worker: WorkerStatus): string {
+  if (worker.draw_busy && worker.phase === "draw_winners") return "Draw winners выполняется";
   if (worker.draw_busy) return "Draw XP выполняется";
   if (worker.stopping) return "останавливается";
   if (!worker.running) return "остановлено";
@@ -282,6 +284,7 @@ export default function App() {
   const [toast, setToast] = useState<{ text: string; error: boolean } | null>(null);
   const [massCode, setMassCode] = useState("");
   const [taskId, setTaskId] = useState("");
+  const [drawCheckId, setDrawCheckId] = useState("");
   const [now, setNow] = useState(Date.now());
   const [theme, setTheme] = useState<ThemeMode>(() => {
     const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -396,6 +399,20 @@ export default function App() {
       const res = await submitMassCode(massCode, tid);
       showToast(res.message);
       setMassCode("");
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : String(e), true);
+    }
+  };
+
+  const submitDrawWinnerCheck = async () => {
+    try {
+      const did = Number(drawCheckId.trim());
+      if (!Number.isInteger(did) || did <= 0) {
+        showToast("drawId must be positive", true);
+        return;
+      }
+      const res = await checkDrawWinners(did);
+      showToast(res.message);
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e), true);
     }
@@ -598,6 +615,28 @@ export default function App() {
             >
               {worker.code_busy ? <Loader2 className="animate-spin" size={16} /> : <Gift size={16} />} Отправить код
             </button>
+          </div>
+
+          <div className="border-t border-slate-200 p-3">
+            <div className="mb-2 flex items-center gap-2 text-sm font-bold text-slate-900">
+              <Trophy size={16} /> Draw winners
+            </div>
+            <div className="grid grid-cols-[1fr_150px] gap-2">
+              <input
+                value={drawCheckId}
+                onChange={(e) => setDrawCheckId(e.target.value)}
+                className="rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-100"
+                placeholder="drawId"
+              />
+              <button
+                className="inline-flex items-center justify-center gap-2 rounded-md bg-cyan-700 px-3 py-2 text-sm font-semibold text-white hover:bg-cyan-800 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!drawCheckId.trim() || topBusy}
+                onClick={submitDrawWinnerCheck}
+              >
+                {worker.draw_busy && worker.phase === "draw_winners" ? <Loader2 className="animate-spin" size={16} /> : <Trophy size={16} />}
+                Check
+              </button>
+            </div>
           </div>
         </aside>
       </main>

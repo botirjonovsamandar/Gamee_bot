@@ -68,3 +68,10 @@ export function submitMassCode(
 export function enterDrawAll(): Promise<{ ok: boolean; message: string }> {
   return request("/api/draw/enter-all", { method: "POST" });
 }
+
+export function checkDrawWinners(drawId: number): Promise<{ ok: boolean; message: string }> {
+  return request("/api/draw/check-winners", {
+    method: "POST",
+    body: JSON.stringify({ draw_id: drawId })
+  });
+}

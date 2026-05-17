@@ -20,6 +20,7 @@ from gamee_bot.config import (
 from gamee_bot.gamee_transport import gamee_transport_backend_blocker_message
 from gamee_bot.telethon_bridge import clear_init_cache
 from gamee_bot.ui.account_action_thread import AccountActionThread
+from gamee_bot.ui.check_draw_winners_thread import CheckDrawWinnersThread
 from gamee_bot.ui.enter_code_thread import EnterCodeThread
 from gamee_bot.ui.enter_draw_thread import EnterDrawThread
 from gamee_bot.web.state import AppStateStore
@@ -35,7 +36,7 @@ class WebRuntime:
         self._worker: BotWorker | None = None
         self._manual_thread: AccountActionThread | None = None
         self._code_thread: EnterCodeThread | None = None
-        self._draw_thread: EnterDrawThread | None = None
+        self._draw_thread: EnterDrawThread | CheckDrawWinnersThread | None = None
         self._manual_moves_used_today: dict[str, tuple[str, int]] = {}
 
     def load(self) -> AppConfig:
@@ -318,6 +319,43 @@ class WebRuntime:
             thread.start()
             return {"ok": True, "message": "Draw XP запущен"}
 
+    def check_draw_winners(self, draw_id: int) -> dict[str, Any]:
+        with self._lock:
+            self._cleanup_finished_threads_locked()
+            self._refresh_busy_flags()
+            if self._worker is not None and self._worker.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Сначала остановите фоновый режим.",
+                )
+            if self._manual_thread is not None and self._manual_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения текущего ручного действия.",
+                )
+            if self._code_thread is not None and self._code_thread.isRunning():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Дождитесь завершения массового промокода.",
+                )
+            if self._draw_thread is not None and self._draw_thread.isRunning():
+                raise HTTPException(status_code=409, detail="Draw уже выполняется.")
+            did = int(draw_id)
+            if did <= 0:
+                raise HTTPException(status_code=400, detail="drawId должен быть положительным.")
+            cfg = self._cfg_ready()
+            self._ensure_can_use_transport(cfg)
+            thread = CheckDrawWinnersThread(cfg, did)
+            thread.log_line.connect(self._on_log, Qt.ConnectionType.DirectConnection)
+            thread.finished.connect(
+                self._on_draw_finished, Qt.ConnectionType.DirectConnection
+            )
+            self._draw_thread = thread
+            self._store.set_worker_status(draw_busy=True, phase="draw_winners")
+            self._store.add_log(f"Draw winners для drawId={did} — старт.")
+            thread.start()
+            return {"ok": True, "message": "Проверка победителей запущена"}
+
     def _on_worker_rows(self, rows: object) -> None:
         if isinstance(rows, list):
             self._store.update_rows([dict(r) for r in rows if isinstance(r, dict)])
@@ -380,7 +418,11 @@ class WebRuntime:
             "draw_busy": draw_busy,
         }
         if draw_busy:
-            patch["phase"] = "draw_xp"
+            patch["phase"] = (
+                "draw_winners"
+                if isinstance(self._draw_thread, CheckDrawWinnersThread)
+                else "draw_xp"
+            )
         elif not running:
             patch["phase"] = "stopped"
         self._store.set_worker_status(**patch)
@@ -410,7 +452,10 @@ class WebRuntime:
     @staticmethod
     def _is_draw_done_log(message: str) -> bool:
         text = str(message or "").strip().casefold()
-        return text.startswith("draw xp:") and "готово" in text
+        return (
+            (text.startswith("draw xp:") or text.startswith("draw winners:"))
+            and "готово" in text
+        )
 
     @staticmethod
     def _thread_is_running(thread: object | None) -> bool:

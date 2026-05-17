@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -41,6 +42,7 @@ from gamee_bot.config import (
 )
 from gamee_bot.ui.account_action_thread import AccountActionThread
 from gamee_bot.ui.add_account_dialog import AddAccountDialog
+from gamee_bot.ui.check_draw_winners_thread import CheckDrawWinnersThread
 from gamee_bot.ui.app_style import apply_app_style
 from gamee_bot.ui.edit_proxy_dialog import EditAccountProxyDialog
 from gamee_bot.ui.enter_code_dialog import EnterCodeDialog
@@ -68,7 +70,7 @@ class MainWindow(QMainWindow):
         self._logged_cfg_error_once = False
         self._telethon_ready = False
         self._enter_code_thread: EnterCodeThread | None = None
-        self._enter_draw_thread: EnterDrawThread | None = None
+        self._enter_draw_thread: EnterDrawThread | CheckDrawWinnersThread | None = None
         self._manual_action_thread: AccountActionThread | None = None
         self._known_account_labels: set[str] = set()
         self._session_gold_earned: defaultdict[str, int] = defaultdict(int)
@@ -149,6 +151,7 @@ class MainWindow(QMainWindow):
         self._btn_stop_bot.setEnabled(running)
         self._btn_enter_code.setEnabled(not manual_busy and not code_busy and not draw_busy)
         self._btn_enter_draw.setEnabled(not running and not manual_busy and not code_busy and not draw_busy)
+        self._btn_check_draw_winners.setEnabled(not running and not manual_busy and not code_busy and not draw_busy)
         sel = self._selected_account_label() is not None
         manual_enabled = sel and not running and not manual_busy and not code_busy and not draw_busy
         self._btn_sync_now.setEnabled(manual_enabled)
@@ -374,6 +377,56 @@ class MainWindow(QMainWindow):
         self._update_worker_status_label()
         th.start()
 
+    def _on_check_draw_winners(self) -> None:
+        self._load_config_silent()
+        if self._cfg is None or self._config_error:
+            QMessageBox.critical(self, "Config", self._config_error or "No config")
+            return
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "Draw winners", "Stop background mode first.")
+            return
+        if self._manual_action_thread is not None and self._manual_action_thread.isRunning():
+            QMessageBox.information(self, "Draw winners", "Wait for the current manual action.")
+            return
+        if self._enter_code_thread is not None and self._enter_code_thread.isRunning():
+            QMessageBox.information(self, "Draw winners", "Wait for the mass code action.")
+            return
+        if self._enter_draw_thread is not None and self._enter_draw_thread.isRunning():
+            QMessageBox.information(self, "Draw winners", "Draw action is already running.")
+            return
+        if not self._telethon_ready:
+            QMessageBox.warning(self, "Telegram API", TELETHON_CREDENTIALS_REQUIRED_MSG)
+            return
+        if not self._ensure_transport_backend_ready("Draw winners"):
+            return
+        try:
+            accounts = load_accounts(self._cfg.accounts_path)
+        except Exception as e:
+            QMessageBox.critical(self, "accounts.yaml", str(e))
+            return
+        if not accounts:
+            QMessageBox.information(self, "Draw winners", "No accounts in accounts.yaml.")
+            return
+        draw_id, ok = QInputDialog.getInt(
+            self,
+            "Draw winners",
+            "drawId:",
+            154,
+            1,
+            999999999,
+            1,
+        )
+        if not ok:
+            return
+        self._log.append(f"--- Draw winners for drawId={draw_id} ---")
+        th = CheckDrawWinnersThread(self._cfg, draw_id, self)
+        self._enter_draw_thread = th
+        th.log_line.connect(self._log.append)
+        th.finished.connect(self._on_enter_draw_thread_finished)
+        self._sync_bot_buttons()
+        self._update_worker_status_label()
+        th.start()
+
     def _on_enter_draw_thread_finished(self) -> None:
         if self.sender() is self._enter_draw_thread:
             self._enter_draw_thread = None
@@ -560,6 +613,12 @@ class MainWindow(QMainWindow):
         )
         self._btn_enter_draw.clicked.connect(self._on_enter_draw_all)
         bar.addWidget(self._btn_enter_draw)
+        self._btn_check_draw_winners = QPushButton("Check winners")
+        self._btn_check_draw_winners.setToolTip(
+            "Checks draw.getWinners for a specific Lucky Draw drawId on every account."
+        )
+        self._btn_check_draw_winners.clicked.connect(self._on_check_draw_winners)
+        bar.addWidget(self._btn_check_draw_winners)
         bar.addStretch()
         self._btn_delete = QPushButton("Удалить выбранный…")
         self._btn_delete.setObjectName("btnStop")

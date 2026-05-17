@@ -14,6 +14,10 @@ class MassCodeRequest(BaseModel):
     task_id: int | None = None
 
 
+class DrawWinnersRequest(BaseModel):
+    draw_id: int = Field(gt=0)
+
+
 class ApiMessage(BaseModel):
     ok: bool = True
     message: str = "ok"
@@ -28,6 +32,7 @@ class WorkerStatus(BaseModel):
     active_count: int = 0
     manual_busy: bool = False
     code_busy: bool = False
+    draw_busy: bool = False
 
 
 class LogEvent(BaseModel):
@@ -41,4 +46,3 @@ class WsEvent(BaseModel):
     type: str
     seq: int
     payload: dict[str, Any]
-

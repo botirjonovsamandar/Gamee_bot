@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
 from gamee_bot.web.runtime import WebRuntime
-from gamee_bot.web.schemas import MassCodeRequest, ProxyUpdateRequest
+from gamee_bot.web.schemas import DrawWinnersRequest, MassCodeRequest, ProxyUpdateRequest
 from gamee_bot.web.state import AppStateStore
 
 
@@ -123,6 +123,10 @@ def create_app() -> FastAPI:
     @app.post("/api/draw/enter-all")
     async def api_draw_enter_all() -> dict[str, Any]:
         return runtime.enter_draw_all()
+
+    @app.post("/api/draw/check-winners")
+    async def api_draw_check_winners(body: DrawWinnersRequest) -> dict[str, Any]:
+        return runtime.check_draw_winners(body.draw_id)
 
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket) -> None:

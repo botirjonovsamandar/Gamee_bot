@@ -666,6 +666,44 @@ def _draw_title(draw: dict[str, Any]) -> str:
     return f"draw #{did}" if did > 0 else "draw"
 
 
+def _draw_reward_text(reward: Any, cfg: GameeConfig) -> str:
+    if not isinstance(reward, dict):
+        return "—"
+    return _format_check_task_code_result({"rewards": [reward]}, cfg)
+
+
+def _draw_user_display(user: Any) -> str:
+    if not isinstance(user, dict):
+        return ""
+    nickname = str(user.get("nickname") or "").strip()
+    if nickname:
+        return "@" + nickname.lstrip("@")
+    parts = [
+        str(user.get("firstname") or "").strip(),
+        str(user.get("lastname") or "").strip(),
+    ]
+    name = " ".join(p for p in parts if p).strip()
+    if name:
+        return name
+    uid = _to_int_or_zero(user.get("id"))
+    return f"user {uid}" if uid > 0 else ""
+
+
+def _draw_winner_entry_for_user(
+    winners: Any,
+    user_id: int | None,
+) -> dict[str, Any] | None:
+    if user_id is None or user_id <= 0 or not isinstance(winners, list):
+        return None
+    for item in winners:
+        if not isinstance(item, dict):
+            continue
+        user = item.get("user")
+        if isinstance(user, dict) and _to_int_or_zero(user.get("id")) == user_id:
+            return item
+    return None
+
+
 def _draw_has_blocking_flag(draw: dict[str, Any]) -> bool:
     blocking_true = (
         "isLocked",
@@ -1132,6 +1170,18 @@ class DrawEnterResult:
     @property
     def entered(self) -> bool:
         return self.entered_micro > 0 and self.draw_id is not None
+
+
+@dataclass(frozen=True)
+class DrawWinnerCheckResult:
+    draw_id: int
+    title: str
+    won: bool
+    rank: int | None
+    reward_text: str
+    user_id: int | None = None
+    user_display: str = ""
+    winners_count: int = 0
 
 
 @dataclass
@@ -2142,6 +2192,73 @@ class GameeClient:
         if not isinstance(result, dict):
             return []
         return _draws_from_result(result)
+
+    def check_lucky_draw_winner(
+        self, session: GameeSession, *, draw_id: int, _relogin: bool = False
+    ) -> DrawWinnerCheckResult:
+        self.ensure_session(session)
+        did = int(draw_id)
+        if did <= 0:
+            raise ValueError("drawId must be positive")
+        rows = self._post_batch(
+            session,
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "draw.getWinners",
+                    "method": "draw.getWinners",
+                    "params": {"drawId": did},
+                }
+            ],
+        )
+        row = self._by_id(rows, "draw.getWinners")
+        if "error" in row:
+            err = row["error"]
+            if not _relogin and _jsonrpc_error_suggests_relogin(err):
+                self._force_relogin(session)
+                return self.check_lucky_draw_winner(
+                    session, draw_id=did, _relogin=True
+                )
+            raise RuntimeError(_jsonrpc_error_message(err))
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("draw.getWinners: empty result")
+
+        draw = result.get("draw")
+        title = _draw_title(draw if isinstance(draw, dict) else {"id": did})
+        winners = result.get("winners")
+        winners_count = len(winners) if isinstance(winners, list) else 0
+        my = result.get("myRanking")
+        my_ranking = my if isinstance(my, dict) else {}
+
+        user = my_ranking.get("user")
+        user_id = _to_int_or_zero(user.get("id")) if isinstance(user, dict) else 0
+        winner_entry = _draw_winner_entry_for_user(
+            winners,
+            user_id if user_id > 0 else None,
+        )
+        if winner_entry is not None:
+            if not isinstance(user, dict):
+                user = winner_entry.get("user")
+            if my_ranking.get("rank") is None:
+                my_ranking = {**my_ranking, "rank": winner_entry.get("rank")}
+            if my_ranking.get("reward") is None:
+                my_ranking = {**my_ranking, "reward": winner_entry.get("reward")}
+
+        rank_raw = my_ranking.get("rank")
+        rank = _to_int_or_zero(rank_raw) if rank_raw is not None else 0
+        reward_text = _draw_reward_text(my_ranking.get("reward"), self._cfg)
+        won = rank > 0 and reward_text != "—"
+        return DrawWinnerCheckResult(
+            draw_id=did,
+            title=title,
+            won=won,
+            rank=rank if rank > 0 else None,
+            reward_text=reward_text,
+            user_id=user_id if user_id > 0 else None,
+            user_display=_draw_user_display(user),
+            winners_count=winners_count,
+        )
 
     def enter_lucky_draw_with_available_xp(
         self, session: GameeSession, *, _relogin: bool = False
